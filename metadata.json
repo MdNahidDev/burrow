@@ -1,0 +1,6 @@
+{
+  "name": "Burrow",
+  "description": "Cross-platform macOS, Windows, and Live Host system cleaner, disk treemap analyzer, smart app uninstaller, and telemetry studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
