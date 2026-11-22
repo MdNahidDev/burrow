@@ -10,7 +10,7 @@ export interface LocalScanResult {
 const MAX_ITEMS = 4000;
 const MAX_DEPTH = 6;
 
-function inferCategory(name: string, isDir: boolean): DiskNode['category'] {
+export function inferCategory(name: string, isDir: boolean): DiskNode['category'] {
   const lower = name.toLowerCase();
   if (
     lower === 'node_modules' ||

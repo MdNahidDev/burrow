@@ -3,11 +3,14 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DiskNode, OsTarget } from '../types/burrow';
 import { formatBytes, formatRelativeDays } from '../utils/format';
 import { scanLocalDirectoryPicker } from '../utils/localFolderScanner';
+import { diskNodeFromNative } from '../utils/nativeData';
+import { analyzePathTauri, pickFolderTauri } from '../utils/tauriBridge';
 import { computeSquarifiedTreemap } from '../utils/treemap';
 import { PlanetOrb } from './PlanetOrb';
 
 interface AnalyzerViewProps {
   os: OsTarget;
+  native?: boolean;
   diskTree: DiskNode;
   mapped: boolean;
   onSetMapped: (mapped: boolean) => void;
@@ -39,6 +42,7 @@ function flattenFiles(node: DiskNode, out: DiskNode[] = []): DiskNode[] {
 
 export function AnalyzerView({
   os,
+  native = false,
   diskTree,
   mapped,
   onSetMapped,
@@ -132,7 +136,38 @@ export function AnalyzerView({
       .sort((a, b) => b.wastedBytes - a.wastedBytes);
   }, [allFiles]);
 
+  // Map a real folder on this PC with the native engine ('' = your user folder).
+  const runNativeScan = async (choose: boolean) => {
+    setScanningLocal(true);
+    try {
+      let target = '';
+      if (choose) {
+        const picked = await pickFolderTauri();
+        if (!picked) return;
+        target = picked;
+      }
+      onNotify('Mapping your folder… large drives can take a minute.');
+      const result = await analyzePathTauri(target);
+      const root = diskNodeFromNative(result.root);
+      setLocalOverrideTree(root);
+      setLocalScanMeta(
+        `${root.path} — ${result.scannedFiles.toLocaleString()} files, ${result.scannedDirs.toLocaleString()} folders${result.truncated ? ' (stopped early after 90 seconds; sizes are partial)' : ''}`,
+      );
+      setPathStack([]);
+      onSetMapped(true);
+      onNotify(`Mapped "${root.name}" (${formatBytes(root.sizeBytes)})`);
+    } catch (error) {
+      onNotify(typeof error === 'string' ? error : error instanceof Error ? error.message : 'Unable to scan that folder.');
+    } finally {
+      setScanningLocal(false);
+    }
+  };
+
   const handleLocalScan = async () => {
+    if (native) {
+      await runNativeScan(true);
+      return;
+    }
     setScanningLocal(true);
     try {
       const result = await scanLocalDirectoryPicker();
@@ -173,16 +208,19 @@ export function AnalyzerView({
             {scanningLocal ? 'Scanning folder...' : 'Choose a drive'}
           </button>
           <button
-            onClick={() => onSetMapped(true)}
-            className="px-8 py-3 rounded-full bg-[var(--pill-active-bg)] text-[var(--pill-active-text)] text-sm font-semibold shadow-[var(--glass-shadow)] hover:opacity-90 transition-opacity"
+            onClick={() => (native ? runNativeScan(false) : onSetMapped(true))}
+            disabled={scanningLocal}
+            className="px-8 py-3 rounded-full bg-[var(--pill-active-bg)] text-[var(--pill-active-text)] text-sm font-semibold shadow-[var(--glass-shadow)] hover:opacity-90 transition-opacity disabled:opacity-50"
           >
-            Map your disk
+            {native && scanningLocal ? 'Mapping…' : native ? 'Map my user folder' : 'Map your disk'}
           </button>
         </div>
 
-        <p className="mt-5 text-xs text-[var(--text-muted)] tabular-nums">
-          Ready to inspect {activeRoot.name} ({formatBytes(activeRoot.sizeBytes)})
-        </p>
+        {!native && (
+          <p className="mt-5 text-xs text-[var(--text-muted)] tabular-nums">
+            Ready to inspect {activeRoot.name} ({formatBytes(activeRoot.sizeBytes)})
+          </p>
+        )}
       </div>
     );
   }

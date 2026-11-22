@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnalyzerView } from './components/AnalyzerView';
 import { AppsView } from './components/AppsView';
 import { DeepCleanView } from './components/DeepCleanView';
+import { LeftoversDialog } from './components/LeftoversDialog';
 import { DryRunDrawer, type ActionExecutionItem } from './components/DryRunDrawer';
 import { OptimizeView } from './components/OptimizeView';
 import { ProfilesView } from './components/ProfilesView';
@@ -23,6 +24,7 @@ import type {
   OsTarget,
   PersistedState,
   PurgeProject,
+  StartupItem,
   TelemetrySnapshot,
 } from './types/burrow';
 import { formatBytes, matchesWhitelist } from './utils/format';
@@ -36,12 +38,32 @@ import {
 } from './utils/localPersistence';
 import {
   cleanWindowsTargetsTauri,
+  deleteAppLeftoversTauri,
   fetchWindowsTelemetry,
+  findAppLeftoversTauri,
   isTauriRuntime,
+  listAppUpdatesTauri,
+  listInstalledAppsTauri,
+  listStartupItemsTauri,
   runWindowsOptimizeTauri,
   runWingetUpgradeTauri,
+  scanDownloadsTauri,
+  scanPurgeProjectsTauri,
   scanWindowsTargetsTauri,
+  setStartupEnabledTauri,
+  uninstallAppTauri,
+  type LeftoverItem,
+  type LeftoverQuery,
+  type LeftoverResult,
 } from './utils/tauriBridge';
+import {
+  appsFromNative,
+  applyScanResults,
+  downloadToTarget,
+  knownCleanTargets,
+  purgeFromNative,
+  startupFromNative,
+} from './utils/nativeData';
 
 type MainTab = 'clean' | 'apps' | 'optimize' | 'analyzer' | 'status';
 type SettingsTab = 'presets' | 'appearance';
@@ -74,16 +96,35 @@ export default function App() {
   const [analyzerMapped, setAnalyzerMapped] = useState(false);
 
   // Offline telemetry state (auto-upgrades to native Rust Tauri sysinfo on Windows PC)
+  const [native] = useState(() => isTauriRuntime());
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(() =>
-    getTelemetryProfile(WINDOWS_OS),
+    isTauriRuntime() ? null : getTelemetryProfile(WINDOWS_OS),
   );
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const [polling, setPolling] = useState(true);
 
   // Live working datasets that reflect GUI clean/uninstall/update actions immediately
-  const [cleanTargets, setCleanTargets] = useState<CleanTarget[]>(WINDOWS_CLEAN_TARGETS);
-  const [purgeProjects, setPurgeProjects] = useState<PurgeProject[]>(WINDOWS_PURGE_PROJECTS);
-  const [appsList, setAppsList] = useState<InstalledApp[]>(WINDOWS_APPS);
+  // In the installed app these start empty and are filled by real scans of this PC.
+  const [cleanTargets, setCleanTargets] = useState<CleanTarget[]>(() =>
+    isTauriRuntime() ? knownCleanTargets() : WINDOWS_CLEAN_TARGETS,
+  );
+  const [purgeProjects, setPurgeProjects] = useState<PurgeProject[]>(() =>
+    isTauriRuntime() ? [] : WINDOWS_PURGE_PROJECTS,
+  );
+  const [appsList, setAppsList] = useState<InstalledApp[]>(() =>
+    isTauriRuntime() ? [] : WINDOWS_APPS,
+  );
+  const [nativeStartup, setNativeStartup] = useState<StartupItem[]>([]);
+  const [appsLoaded, setAppsLoaded] = useState(false);
+
+  // Revo-style review window shown after a program has been uninstalled.
+  const [leftoverQueue, setLeftoverQueue] = useState<LeftoverQuery[]>([]);
+  const [leftoverReview, setLeftoverReview] = useState<{
+    query: LeftoverQuery;
+    items: LeftoverItem[];
+    results: LeftoverResult[] | null;
+    busy: boolean;
+  } | null>(null);
 
   // Offline localStorage persistence for presets, whitelist, and run history
   const [persisted, setPersisted] = useState<PersistedState>(() => loadLocalState());
@@ -91,18 +132,16 @@ export default function App() {
   // Working selections
   const [selectedCleanIds, setSelectedCleanIds] = useState<Set<string>>(
     () =>
-      new Set([
-        'win-user-temp',
-        'win-dx-shader',
-        'win-edge-chrome',
-        'win-nuget-npm',
-        'win-inst-cuda',
-      ]),
+      new Set(
+        isTauriRuntime()
+          ? ['win-user-temp', 'win-dx-shader', 'win-edge-chrome', 'win-nuget-npm']
+          : ['win-user-temp', 'win-dx-shader', 'win-edge-chrome', 'win-nuget-npm', 'win-inst-cuda'],
+      ),
   );
   const [selectedUninstallIds, setSelectedUninstallIds] = useState<Set<string>>(() => new Set());
   const [selectedUpgradeIds, setSelectedUpgradeIds] = useState<Set<string>>(() => new Set());
   const [selectedPurgeIds, setSelectedPurgeIds] = useState<Set<string>>(
-    () => new Set(['wp-1', 'wp-2', 'wp-3', 'wp-5']),
+    () => new Set(isTauriRuntime() ? [] : ['wp-1', 'wp-2', 'wp-3', 'wp-5']),
   );
   const [selectedOptimizeIds, setSelectedOptimizeIds] = useState<Set<string>>(
     () => new Set(['wo-dns', 'wo-thumb', 'wo-standby']),
@@ -148,35 +187,49 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKey);
   }, [settingsOpen]);
 
-  // Scan local Windows target sizes when running inside Tauri on PC
+  // Real scan of this PC: known cache folders, big downloads, and developer build folders.
   const refreshNativeWindowsTargets = useCallback(async () => {
     if (!isTauriRuntime()) return;
     try {
-      const results = await scanWindowsTargetsTauri(
-        WINDOWS_CLEAN_TARGETS.map((t) => ({ id: t.id, path: t.path })),
-      );
-      const byId = new Map(results.map((r) => [r.id, r]));
-      setCleanTargets(
-        WINDOWS_CLEAN_TARGETS.map((t) => {
-          const hit = byId.get(t.id);
-          return hit
-            ? {
-                ...t,
-                path: hit.path,
-                sizeBytes: hit.sizeBytes,
-                itemCount: hit.itemCount,
-              }
-            : t;
-        }),
-      );
+      const base = knownCleanTargets();
+      const [results, downloads, purge] = await Promise.all([
+        scanWindowsTargetsTauri(base.map((t) => ({ id: t.id, path: t.path }))),
+        scanDownloadsTauri().catch(() => []),
+        scanPurgeProjectsTauri().catch(() => []),
+      ]);
+      setCleanTargets([...applyScanResults(base, results), ...downloads.map(downloadToTarget)]);
+      setPurgeProjects(purgeFromNative(purge));
     } catch {
-      // Keep current Windows target state if scan fails
+      showToast('Could not finish scanning this PC. Please try again.');
     }
-  }, []);
+  }, [showToast]);
+
+  // Real list of installed programs, available updates and startup items.
+  const refreshNativeApps = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const [apps, updates, startup] = await Promise.all([
+        listInstalledAppsTauri(),
+        listAppUpdatesTauri().catch(() => {
+          showToast('Update checks need the Windows Package Manager, which was not found.');
+          return [];
+        }),
+        listStartupItemsTauri().catch(() => []),
+      ]);
+      setAppsList(appsFromNative(apps, updates));
+      setNativeStartup(startupFromNative(startup));
+      setStartupStates({});
+      setAppsLoaded(true);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Could not read the installed programs.');
+    }
+  }, [showToast]);
 
   useEffect(() => {
-    refreshNativeWindowsTargets();
-  }, [refreshNativeWindowsTargets]);
+    if (native && activeTab === 'apps' && !appsLoaded) {
+      refreshNativeApps();
+    }
+  }, [native, activeTab, appsLoaded, refreshNativeApps]);
 
   // Sample Windows telemetry completely offline (native Rust sysinfo in Tauri or local Windows profile)
   const sampleTelemetry = useCallback(async () => {
@@ -188,6 +241,8 @@ export default function App() {
     try {
       const snap = await fetchWindowsTelemetry();
       setTelemetry(snap);
+    } catch {
+      // keep the previous real reading
     } finally {
       setTelemetryLoading(false);
     }
@@ -205,11 +260,11 @@ export default function App() {
 
   const startupItems = useMemo(
     () =>
-      WINDOWS_STARTUP.map((item) => ({
+      (native ? nativeStartup : WINDOWS_STARTUP).map((item) => ({
         ...item,
         enabled: startupStates[item.id] ?? item.enabled,
       })),
-    [startupStates],
+    [startupStates, native, nativeStartup],
   );
 
   const activeWhitelistPatterns = useMemo(
@@ -322,6 +377,34 @@ export default function App() {
     setDrawerOpen(true);
   };
 
+  // Show the next program's leftovers (one window at a time).
+  useEffect(() => {
+    if (leftoverReview || leftoverQueue.length === 0) return;
+    const [next, ...rest] = leftoverQueue;
+    setLeftoverQueue(rest);
+    setLeftoverReview({ query: next, items: [], results: null, busy: true });
+    findAppLeftoversTauri(next)
+      .then((items) => setLeftoverReview({ query: next, items, results: null, busy: false }))
+      .catch((err) => {
+        showToast(typeof err === 'string' ? err : 'Could not search for leftovers.');
+        setLeftoverReview(null);
+      });
+  }, [leftoverQueue, leftoverReview, showToast]);
+
+  const handleDeleteLeftovers = async (selected: LeftoverItem[]) => {
+    if (!leftoverReview) return;
+    setLeftoverReview({ ...leftoverReview, busy: true });
+    try {
+      const results = await deleteAppLeftoversTauri(leftoverReview.query, selected);
+      setLeftoverReview((prev) => (prev ? { ...prev, results, busy: false } : prev));
+      const removed = results.filter((r) => r.ok).length;
+      showToast(`Removed ${removed} of ${results.length} leftover items.`);
+    } catch (err) {
+      showToast(typeof err === 'string' ? err : 'Could not remove the leftovers.');
+      setLeftoverReview((prev) => (prev ? { ...prev, busy: false } : prev));
+    }
+  };
+
   // Execute staged Windows actions via native Rust Tauri commands (or instant local preview update)
   const handleExecuteActions = async (asDryRun: boolean) => {
     if (executingRef.current) return;
@@ -334,6 +417,7 @@ export default function App() {
       const succeededUninstallIds = new Set<string>();
       const succeededUpgradeIds = new Set<string>();
       const succeededOptimizeIds = new Set<string>();
+      const queueForReview: LeftoverQuery[] = [];
 
       // 1. Temp, caches, installers, and build clutter folders
       const folderTargets = [
@@ -390,32 +474,49 @@ export default function App() {
           );
           const leftoverBytes = eligibleLeftovers.reduce((s, l) => s + l.sizeBytes, 0);
           let ok = true;
-          let status = asDryRun ? 'Ready to remove' : 'Uninstalled';
+          let status = asDryRun ? 'Ready to uninstall' : 'Uninstalled';
 
-          if (tauriAttached) {
-            const fsPaths = eligibleLeftovers
-              .filter((l) => l.kind !== 'Registry' && l.kind !== 'ScheduledTask')
-              .map((l) => ({ id: l.id, path: l.path }));
-            if (fsPaths.length > 0) {
+          if (tauriAttached && !asDryRun) {
+            if (app.id.startsWith('winget:')) {
+              ok = false;
+              status = 'Store apps are removed from Windows Settings';
+            } else {
               try {
-                const leftoverReports = await cleanWindowsTargetsTauri(
-                  fsPaths,
-                  asDryRun,
-                  activeWhitelistPatterns,
-                );
-                const skippedCount = leftoverReports.filter((r) => r.status.startsWith('skipped')).length;
-                if (skippedCount > 0 && skippedCount === leftoverReports.length) {
+                // Opens the program's own uninstall window; wait for it to close.
+                await uninstallAppTauri(app.id);
+                const stillThere = (await listInstalledAppsTauri()).some((a) => a.id === app.id);
+                if (stillThere) {
                   ok = false;
-                  status = 'Skipped (protected or in use)';
-                } else if (skippedCount > 0) {
-                  status = asDryRun
-                    ? 'Ready (some protected skipped)'
-                    : `Uninstalled (${skippedCount} in use)`;
+                  status = 'Not removed (uninstall was cancelled or not finished)';
                 }
               } catch (err) {
                 ok = false;
-                status = err instanceof Error ? err.message : 'Uninstall failed';
+                const msg = typeof err === 'string' ? err : err instanceof Error ? err.message : 'Uninstall failed';
+                status = msg;
+                if (msg.includes('no uninstaller')) {
+                  const binary = app.leftovers.find((l) => l.kind === 'Binary');
+                  queueForReview.push({
+                    appId: app.id,
+                    name: app.name,
+                    publisher: app.publisher === 'Unknown publisher' ? '' : app.publisher,
+                    installLocation: binary && binary.path !== app.name ? binary.path : '',
+                    force: true,
+                  });
+                  status = 'No uninstaller found: choose what to remove manually';
+                }
               }
+            }
+
+            // Hunt for files and registry keys left behind; the person reviews them next.
+            if (ok) {
+              const binary = app.leftovers.find((l) => l.kind === 'Binary');
+              queueForReview.push({
+                appId: app.id,
+                name: app.name,
+                publisher: app.publisher === 'Unknown publisher' ? '' : app.publisher,
+                installLocation: binary && binary.path !== app.name ? binary.path : '',
+                force: false,
+              });
             }
           }
 
@@ -423,7 +524,7 @@ export default function App() {
           report.push({
             id: app.id,
             label: `Uninstall ${app.name}`,
-            detail: `${eligibleLeftovers.length} leftover locations`,
+            detail: `${eligibleLeftovers.length} related locations`,
             bytes: leftoverBytes,
             status,
             ok,
@@ -483,23 +584,38 @@ export default function App() {
 
       // 5. Startup changes
       for (const st of stagedStartupChanges) {
+        let ok = true;
+        let status = asDryRun ? 'Verified' : st.enabled ? 'Enabled' : 'Paused';
+        if (tauriAttached && !asDryRun) {
+          const [scope, ...rest] = st.id.split(':');
+          try {
+            await setStartupEnabledTauri(scope, rest.join(':'), st.enabled);
+          } catch (err) {
+            ok = false;
+            status = err instanceof Error ? err.message : 'Could not change this item';
+          }
+        }
         report.push({
           id: `st-${st.id}`,
           label: `${st.name} startup`,
           detail: st.publisher,
           bytes: 0,
-          status: asDryRun ? 'Verified' : st.enabled ? 'Enabled' : 'Paused',
-          ok: true,
+          status,
+          ok,
         });
       }
 
       const reclaimedBytes = report.filter((r) => r.ok).reduce((s, r) => s + r.bytes, 0);
       setActionResults(report);
+      if (queueForReview.length > 0) setLeftoverQueue(queueForReview);
 
       // Update live UI state only for actions that actually succeeded
       if (!asDryRun) {
         if (tauriAttached) {
           await refreshNativeWindowsTargets();
+          if (stagedUninstallApps.length > 0 || stagedUpgradeApps.length > 0 || stagedStartupChanges.length > 0) {
+            await refreshNativeApps();
+          }
         } else {
           setCleanTargets((prev) =>
             prev.map((t) =>
@@ -508,11 +624,11 @@ export default function App() {
           );
         }
 
-        if (succeededFolderIds.size > 0) {
+        if (succeededFolderIds.size > 0 && !tauriAttached) {
           setPurgeProjects((prev) => prev.filter((p) => !succeededFolderIds.has(p.id)));
         }
 
-        if (succeededUninstallIds.size > 0 || succeededUpgradeIds.size > 0) {
+        if (!tauriAttached && (succeededUninstallIds.size > 0 || succeededUpgradeIds.size > 0)) {
           setAppsList((prev) =>
             prev
               .filter((a) => !succeededUninstallIds.has(a.id))
@@ -551,7 +667,7 @@ export default function App() {
           for (const id of succeededOptimizeIds) next.delete(id);
           return next;
         });
-        setStartupStates({});
+        if (!tauriAttached) setStartupStates({});
       }
 
       const successCount = report.filter((r) => r.ok).length;
@@ -658,6 +774,7 @@ export default function App() {
             onChangeThreshold={setStaleThresholdDays}
             onAddWhitelist={(pattern, reason) => handleAddWhitelist(pattern, reason, WINDOWS_OS)}
             onOpenDryRun={openActionRunner}
+            onRescan={native ? refreshNativeWindowsTargets : undefined}
           />
         )}
 
@@ -678,8 +795,8 @@ export default function App() {
             }}
             onOpenDryRun={openActionRunner}
             onRefresh={() => {
-              refreshNativeWindowsTargets();
-              showToast('Local Windows inventory refreshed.');
+              if (native) refreshNativeApps();
+              showToast('Refreshing your installed programs…');
             }}
           />
         )}
@@ -707,6 +824,7 @@ export default function App() {
         {activeTab === 'analyzer' && (
           <AnalyzerView
             os={WINDOWS_OS}
+            native={native}
             diskTree={WINDOWS_DISK_TREE}
             mapped={analyzerMapped}
             onSetMapped={setAnalyzerMapped}
@@ -918,6 +1036,22 @@ export default function App() {
       )}
 
       {/* One-Click Windows GUI Action Confirmation & Execution Sheet */}
+      {leftoverReview && (
+        <LeftoversDialog
+          key={leftoverReview.query.appId + (leftoverReview.busy && leftoverReview.items.length === 0 ? '-loading' : '')}
+          appName={leftoverReview.query.name}
+          forced={leftoverReview.query.force}
+          items={leftoverReview.items}
+          busy={leftoverReview.busy}
+          results={leftoverReview.results}
+          onDelete={handleDeleteLeftovers}
+          onClose={() => {
+            setLeftoverReview(null);
+            refreshNativeWindowsTargets();
+          }}
+        />
+      )}
+
       <DryRunDrawer
         open={drawerOpen}
         dryRun={dryRunDefault}

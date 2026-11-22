@@ -45,11 +45,8 @@ export async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>
 
 export async function fetchWindowsTelemetry(): Promise<TelemetrySnapshot> {
   if (isTauriRuntime()) {
-    try {
-      return await invokeTauri<TelemetrySnapshot>('get_system_telemetry');
-    } catch {
-      return getTelemetryProfile('windows');
-    }
+    // Real PC data only: if this fails the caller keeps the previous reading.
+    return invokeTauri<TelemetrySnapshot>('get_system_telemetry');
   }
   return getTelemetryProfile('windows');
 }
@@ -77,3 +74,114 @@ export async function runWindowsOptimizeTauri(taskId: string, dryRun: boolean): 
 export async function runWingetUpgradeTauri(packageId: string, dryRun: boolean): Promise<string> {
   return invokeTauri<string>('run_winget_upgrade', { packageId, dryRun });
 }
+
+// ---- Native PC features (installed apps, updates, startup, scans) ----
+
+export interface NativeLeftover {
+  id: string;
+  path: string;
+  kind: string;
+  sizeBytes: number;
+  requiresAdmin: boolean;
+}
+
+export interface NativeApp {
+  id: string;
+  name: string;
+  version: string;
+  publisher: string;
+  installLocation: string;
+  binarySizeBytes: number;
+  installedDaysAgo: number;
+  leftovers: NativeLeftover[];
+}
+
+export interface NativeUpdate {
+  id: string;
+  name: string;
+  version: string;
+  available: string;
+}
+
+export interface NativeStartup {
+  scope: string;
+  name: string;
+  command: string;
+  publisher: string;
+  enabled: boolean;
+}
+
+export interface NativeDownload {
+  path: string;
+  name: string;
+  sizeBytes: number;
+  modifiedDaysAgo: number;
+}
+
+export interface NativePurge {
+  projectName: string;
+  artifactType: string;
+  framework: string;
+  path: string;
+  sizeBytes: number;
+  staleDays: number;
+  fileCount: number;
+}
+
+export interface NativeDiskNode {
+  id: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+  kind: 'directory' | 'file';
+  modifiedDaysAgo: number;
+  hashGroup?: string;
+  children?: NativeDiskNode[];
+}
+
+export interface NativeAnalyzeResult {
+  root: NativeDiskNode;
+  scannedFiles: number;
+  scannedDirs: number;
+  truncated: boolean;
+}
+
+export const listInstalledAppsTauri = () => invokeTauri<NativeApp[]>('list_installed_apps');
+export const uninstallAppTauri = (appId: string) => invokeTauri<string>('uninstall_app', { appId });
+export const listAppUpdatesTauri = () => invokeTauri<NativeUpdate[]>('list_app_updates');
+export const listStartupItemsTauri = () => invokeTauri<NativeStartup[]>('list_startup_items');
+export const setStartupEnabledTauri = (scope: string, name: string, enabled: boolean) =>
+  invokeTauri<string>('set_startup_enabled', { scope, name, enabled });
+export const scanDownloadsTauri = () => invokeTauri<NativeDownload[]>('scan_downloads');
+export const scanPurgeProjectsTauri = () => invokeTauri<NativePurge[]>('scan_purge_projects');
+export const analyzePathTauri = (path: string) =>
+  invokeTauri<NativeAnalyzeResult>('analyze_path', { path });
+export const pickFolderTauri = () => invokeTauri<string | null>('pick_folder');
+
+// ---- Deep leftover removal (files, folders, registry keys) ----
+
+export interface LeftoverQuery {
+  appId: string;
+  name: string;
+  publisher: string;
+  installLocation: string;
+  force: boolean;
+}
+
+export interface LeftoverItem {
+  kind: 'folder' | 'file' | 'registry';
+  path: string;
+  sizeBytes: number;
+  risk: 'safe' | 'review';
+}
+
+export interface LeftoverResult {
+  path: string;
+  ok: boolean;
+  message: string;
+}
+
+export const findAppLeftoversTauri = (query: LeftoverQuery) =>
+  invokeTauri<LeftoverItem[]>('find_app_leftovers', { query });
+export const deleteAppLeftoversTauri = (query: LeftoverQuery, items: LeftoverItem[]) =>
+  invokeTauri<LeftoverResult[]>('delete_app_leftovers', { query, items });

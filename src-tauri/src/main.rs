@@ -4,13 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate,
     RefreshKind, System,
 };
-use walkdir::WalkDir;
+mod native;
 
 struct TelemetryState {
     sys: Mutex<System>,
@@ -197,6 +196,20 @@ fn allowed_clean_roots() -> Vec<(String, bool)> {
     roots
 }
 
+fn is_safe_purge_path(path: &Path, normalized: &str) -> bool {
+    const NEVER: [&str; 5] = [".ssh", ".gnupg", ".aws", ".kube", "appdata"];
+    if normalized.split('\\').any(|seg| NEVER.contains(&seg)) {
+        return false;
+    }
+    if normalized.starts_with("c:\\windows") || normalized.starts_with("c:\\program files") {
+        return false;
+    }
+    let (Some(name), Some(parent)) = (path.file_name().and_then(|n| n.to_str()), path.parent()) else {
+        return false;
+    };
+    path.is_dir() && native::classify_artifact(&name.to_lowercase(), parent).is_some()
+}
+
 /// Guards against empty paths, traversal, anything outside the allowed cleanup
 /// roots, credentials/key folders and virtual-disk images (e.g. Docker's docker_data.vhdx).
 fn is_safe_clean_path(path: &Path) -> bool {
@@ -215,6 +228,12 @@ fn is_safe_clean_path(path: &Path) -> bool {
     let normalized = normalize_win(trimmed);
     if normalized.len() <= 3 {
         return false;
+    }
+
+    // Regenerable developer build folders (node_modules, target, ...) are allowed
+    // wherever the project lives, but only when the project file sits next to them.
+    if is_safe_purge_path(path, &normalized) {
+        return true;
     }
 
     // Never touch virtual disks, key stores or personal document folders.
@@ -281,21 +300,7 @@ fn matches_protected_pattern(path: &Path, patterns: &[String]) -> bool {
 }
 
 fn measure_folder_fast(path: &Path) -> (u64, usize) {
-    if path.is_file() {
-        let len = path.metadata().map(|m| m.len()).unwrap_or(0);
-        return (len, 1);
-    }
-    let mut bytes = 0u64;
-    let mut count = 0usize;
-    for entry in WalkDir::new(path).max_depth(4).into_iter().flatten() {
-        if entry.file_type().is_file() {
-            count += 1;
-            if let Ok(meta) = entry.metadata() {
-                bytes = bytes.saturating_add(meta.len());
-            }
-        }
-    }
-    (bytes, count)
+    native::dir_size(path)
 }
 
 fn clean_directory_contents(dir: &Path) -> (usize, usize) {
@@ -472,7 +477,13 @@ fn get_system_telemetry(state: tauri::State<TelemetryState>) -> TelemetrySnapsho
 }
 
 #[tauri::command]
-fn scan_windows_targets(targets: Vec<CleanTargetInput>) -> Vec<CleanScanResult> {
+async fn scan_windows_targets(targets: Vec<CleanTargetInput>) -> Vec<CleanScanResult> {
+    tauri::async_runtime::spawn_blocking(move || scan_targets_blocking(targets))
+        .await
+        .unwrap_or_default()
+}
+
+fn scan_targets_blocking(targets: Vec<CleanTargetInput>) -> Vec<CleanScanResult> {
     targets
         .into_iter()
         .map(|target| {
@@ -505,7 +516,17 @@ fn scan_windows_targets(targets: Vec<CleanTargetInput>) -> Vec<CleanScanResult> 
 }
 
 #[tauri::command]
-fn clean_windows_targets(
+async fn clean_windows_targets(
+    targets: Vec<CleanTargetInput>,
+    dry_run: bool,
+    protected_patterns: Option<Vec<String>>,
+) -> Vec<CleanActionReport> {
+    tauri::async_runtime::spawn_blocking(move || clean_targets_blocking(targets, dry_run, protected_patterns))
+        .await
+        .unwrap_or_default()
+}
+
+fn clean_targets_blocking(
     targets: Vec<CleanTargetInput>,
     dry_run: bool,
     protected_patterns: Option<Vec<String>>,
@@ -606,7 +627,7 @@ fn clean_windows_targets(
 }
 
 #[tauri::command]
-fn run_windows_optimize(task_id: String, dry_run: bool) -> Result<String, String> {
+async fn run_windows_optimize(task_id: String, dry_run: bool) -> Result<String, String> {
     let script = match task_id.as_str() {
         "wo-dns" => "Clear-DnsClientCache",
         "wo-thumb" => "Remove-Item \"$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\thumbcache_*.db\" -Force -ErrorAction SilentlyContinue",
@@ -620,21 +641,17 @@ fn run_windows_optimize(task_id: String, dry_run: bool) -> Result<String, String
         return Ok("Verified".to_string());
     }
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .map_err(|e| format!("Failed to invoke PowerShell: {}", e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            "Action requires elevated permissions or was skipped.".to_string()
-        } else {
-            stderr
+    tauri::async_runtime::spawn_blocking(move || {
+        native::run_powershell(script, &[]).map_err(|e| {
+            if e.trim().is_empty() {
+                "Needs administrator rights or was skipped.".to_string()
+            } else {
+                e
+            }
         })
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn is_valid_winget_id(package_id: &str) -> bool {
@@ -647,36 +664,39 @@ fn is_valid_winget_id(package_id: &str) -> bool {
 }
 
 #[tauri::command]
-fn run_winget_upgrade(package_id: String, dry_run: bool) -> Result<String, String> {
+async fn run_winget_upgrade(package_id: String, dry_run: bool) -> Result<String, String> {
     if !is_valid_winget_id(&package_id) {
         return Err("Invalid Windows package identifier.".to_string());
     }
     if dry_run {
         return Ok(format!("Ready to update {}", package_id));
     }
-    let output = Command::new("winget")
-        .args([
-            "upgrade",
-            "--id",
-            &package_id,
-            "--exact",
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to invoke winget: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = native::hidden("winget")
+            .args([
+                "upgrade",
+                "--id",
+                &package_id,
+                "--exact",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--disable-interactivity",
+            ])
+            .output()
+            .map_err(|_| "The Windows Package Manager (winget) was not found.".to_string())?;
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if stderr.is_empty() {
-            format!("winget exited with status {}", output.status)
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         } else {
-            stderr
-        })
-    }
+            Err(format!(
+                "The update did not finish (code {}). Close the app and try again.",
+                output.status.code().unwrap_or(-1)
+            ))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn main() {
@@ -688,6 +708,17 @@ fn main() {
             clean_windows_targets,
             run_windows_optimize,
             run_winget_upgrade,
+            native::list_installed_apps,
+            native::uninstall_app,
+            native::list_app_updates,
+            native::list_startup_items,
+            native::set_startup_enabled,
+            native::scan_downloads,
+            native::scan_purge_projects,
+            native::analyze_path,
+            native::pick_folder,
+            native::find_app_leftovers,
+            native::delete_app_leftovers,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Burrow Tauri application");

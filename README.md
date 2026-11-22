@@ -21,3 +21,14 @@ Installers appear in `src-tauri\target\release\bundle\`.
 The native cleaner only deletes inside an allowlist of cache/temp folders, never touches
 virtual disks (.vhdx etc.), `.ssh`, Documents/Desktop/Pictures, and honours your protected
 rules (`*` / `?` wildcards). Always use Dry-run first.
+
+## What is real in the installed Windows app
+- **Apps**: lists your real installed programs (from the Windows registry) and real update availability.
+  Uninstall opens the program's own uninstaller, then Burrow searches for leftover files and
+  registry keys and lets you review and delete them (registry keys are backed up first to
+  `%LOCALAPPDATA%\Burrow\RegistryBackups`).
+- **Deep Clean**: scans your real temp/cache folders, big installers in Downloads and developer
+  build folders (node_modules, target, ...).
+- **Analyzer**: maps a real folder on your PC (choose any folder with the picker).
+- **Startup**: real startup programs; turning one off/on changes the same switch Task Manager uses.
+- Some items (Windows Update cache, system startup items) need **Run as administrator**.

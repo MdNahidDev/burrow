@@ -29,6 +29,7 @@ interface DeepCleanViewProps {
   onChangeThreshold: (days: number) => void;
   scanned: boolean;
   onSetScanned: (scanned: boolean) => void;
+  onRescan?: () => Promise<void>;
   onAddWhitelist: (pattern: string, reason: string) => void;
   onOpenDryRun: () => void;
 }
@@ -48,6 +49,7 @@ export function DeepCleanView({
   onChangeThreshold,
   scanned,
   onSetScanned,
+  onRescan,
   onAddWhitelist,
   onOpenDryRun,
 }: DeepCleanViewProps) {
@@ -135,6 +137,14 @@ export function DeepCleanView({
       window.clearTimeout(scanTimerRef.current);
     }
     setScanning(true);
+    if (onRescan) {
+      // Real scan of this PC; can take a little while on big drives.
+      onRescan().finally(() => {
+        setScanning(false);
+        onSetScanned(true);
+      });
+      return;
+    }
     scanTimerRef.current = window.setTimeout(() => {
       scanTimerRef.current = null;
       setScanning(false);

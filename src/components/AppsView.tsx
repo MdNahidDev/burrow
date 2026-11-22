@@ -261,7 +261,7 @@ export function AppsView({
                       <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 text-xs text-[var(--text-muted)] tabular-nums">
                         <span>{app.version}</span>
                         <span>{formatBytes(footprint)}</span>
-                        <span>Used {formatRelativeDays(app.lastUsedDays)}</span>
+                        {app.lastUsedDays >= 0 && <span>Installed {formatRelativeDays(app.lastUsedDays)}</span>}
                         {outdated && (
                           <span className="inline-flex items-center gap-0.5 text-[var(--status-safe)] font-medium">
                             <ArrowUpRight className="w-3 h-3" />
