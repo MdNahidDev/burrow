@@ -8,6 +8,7 @@ interface LeftoversDialogProps {
   forced: boolean;
   items: LeftoverItem[];
   busy: boolean;
+  searching?: boolean;
   results: LeftoverResult[] | null;
   onDelete: (selected: LeftoverItem[]) => void;
   onClose: () => void;
@@ -18,6 +19,7 @@ export function LeftoversDialog({
   forced,
   items,
   busy,
+  searching = false,
   results,
   onDelete,
   onClose,
@@ -49,7 +51,9 @@ export function LeftoversDialog({
               {forced ? `Remove ${appName} manually` : `Leftovers from ${appName}`}
             </h2>
             <p className="mt-1 text-xs text-[var(--text-secondary)]">
-              {results
+              {searching
+                ? 'Searching your files and registry for anything left behind…'
+                : results
                 ? 'Done. Here is what happened to each item.'
                 : items.length === 0
                   ? 'Nothing left behind. This program is fully removed.'
@@ -108,7 +112,9 @@ export function LeftoversDialog({
             {results ? '' : `${selectedItems.length} selected${selectedBytes > 0 ? ` · ${formatBytes(selectedBytes)}` : ''}`}
           </span>
           <div className="flex gap-2">
-            {results || items.length === 0 ? (
+            {searching ? (
+              <Loader2 className="w-4 h-4 animate-spin text-[var(--text-secondary)]" />
+            ) : results || items.length === 0 ? (
               <button
                 onClick={onClose}
                 className="px-5 py-2 text-xs font-semibold rounded-full bg-[var(--pill-active-bg)] text-[var(--pill-active-text)]"

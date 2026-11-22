@@ -177,8 +177,25 @@ fn allowed_clean_roots() -> Vec<(String, bool)> {
         }
     };
     let var = |k: &str| env::var(k).ok();
-    push(var("LOCALAPPDATA"), "", false);
-    push(var("APPDATA"), "", false);
+    // Only specific cache folders inside AppData, never AppData itself (browser
+    // profiles, saved logins and app settings live there).
+    for tail in [
+        "Temp",
+        "CrashDumps",
+        "D3DSCache",
+        "NVIDIA\\DXCache",
+        "AMD\\DxCache",
+        "npm-cache",
+        "Microsoft\\Windows\\INetCache",
+        "Microsoft\\Edge\\User Data\\Default\\Cache",
+        "Microsoft\\Edge\\User Data\\Default\\Code Cache",
+        "Microsoft\\Edge\\User Data\\Default\\GPUCache",
+        "Google\\Chrome\\User Data\\Default\\Cache",
+        "Google\\Chrome\\User Data\\Default\\Code Cache",
+        "Google\\Chrome\\User Data\\Default\\GPUCache",
+    ] {
+        push(var("LOCALAPPDATA"), tail, true);
+    }
     push(var("USERPROFILE"), "Downloads", false);
     push(var("USERPROFILE"), ".nuget", false);
     push(var("TEMP"), "", true);
@@ -303,6 +320,12 @@ fn measure_folder_fast(path: &Path) -> (u64, usize) {
     native::dir_size(path)
 }
 
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn clean_directory_contents(dir: &Path) -> (usize, usize) {
     let mut removed = 0usize;
     let mut skipped = 0usize;
@@ -330,6 +353,38 @@ fn clean_directory_contents(dir: &Path) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cleaning_never_follows_a_link_to_another_folder() {
+        let base = std::env::temp_dir().join(format!("burrow-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let project = base.join("proj");
+        let elsewhere = base.join("precious");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(project.join("package.json"), "{}").unwrap();
+        fs::write(elsewhere.join("keep.txt"), "important").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, project.join("node_modules")).unwrap();
+
+        let target = CleanTargetInput {
+            id: "t".into(),
+            path: project.join("node_modules").to_string_lossy().to_string(),
+        };
+        let reports = clean_targets_blocking(vec![target], false, None);
+        assert!(elsewhere.join("keep.txt").exists(), "link target was emptied: {:?}", reports.iter().map(|r| &r.status).collect::<Vec<_>>());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn broad_appdata_folders_are_not_cleanable() {
+        std::env::set_var("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local");
+        std::env::set_var("APPDATA", "C:\\Users\\a\\AppData\\Roaming");
+        assert!(!is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles")));
+        assert!(!is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data")));
+        assert!(is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\D3DSCache")));
+        assert!(is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Cache")));
+    }
 
     #[test]
     fn glob_protects_wildcard_rules() {
@@ -556,6 +611,11 @@ fn clean_targets_blocking(
             for resolved in paths {
                 if !is_safe_clean_path(&resolved) {
                     blocked_reason = Some("skipped (protected system path)".to_string());
+                    continue;
+                }
+                // A folder link/junction would make us empty whatever it points to.
+                if is_link(&resolved) {
+                    blocked_reason = Some("skipped (folder link)".to_string());
                     continue;
                 }
                 if matches_protected_pattern(&resolved, &protected) {

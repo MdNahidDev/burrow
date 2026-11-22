@@ -33,13 +33,23 @@ pub fn hidden(program: &str) -> Command {
     cmd
 }
 
+/// Full path to Windows PowerShell so a look-alike program earlier on PATH is never used.
+fn powershell_exe() -> String {
+    env::var("SystemRoot")
+        .or_else(|_| env::var("WINDIR"))
+        .map(|root| format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", root.trim_end_matches('\\')))
+        .ok()
+        .filter(|p| Path::new(p).exists())
+        .unwrap_or_else(|| "powershell".to_string())
+}
+
 /// Run a PowerShell snippet silently and return its trimmed stdout.
 pub fn run_powershell(script: &str, envs: &[(&str, &str)]) -> Result<String, String> {
     let full = format!(
         "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Continue'; {}",
         script
     );
-    let mut cmd = hidden("powershell");
+    let mut cmd = hidden(&powershell_exe());
     cmd.args([
         "-NoProfile",
         "-NonInteractive",
@@ -93,13 +103,24 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 
 /// Total size and file count of a folder (no depth limit, does not follow links).
 pub fn dir_size(path: &Path) -> (u64, usize) {
+    let (bytes, files, _) = dir_size_until(path, None);
+    (bytes, files)
+}
+
+/// Like `dir_size` but stops at `deadline`; the third value is true when it stopped early.
+pub fn dir_size_until(path: &Path, deadline: Option<Instant>) -> (u64, usize, bool) {
     if path.is_file() {
-        return (path.metadata().map(|m| m.len()).unwrap_or(0), 1);
+        return (path.metadata().map(|m| m.len()).unwrap_or(0), 1, false);
     }
     let mut bytes = 0u64;
     let mut files = 0usize;
     let mut stack = vec![path.to_path_buf()];
+    let mut tick = 0u32;
     while let Some(dir) = stack.pop() {
+        tick += 1;
+        if tick % 64 == 0 && deadline.map_or(false, |d| Instant::now() > d) {
+            return (bytes, files, true);
+        }
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
@@ -114,7 +135,7 @@ pub fn dir_size(path: &Path) -> (u64, usize) {
             }
         }
     }
-    (bytes, files)
+    (bytes, files, false)
 }
 
 fn days_since(time: Option<SystemTime>) -> u64 {
@@ -220,42 +241,36 @@ const GENERIC_FOLDERS: [&str; 18] = [
     "roaming", "apple", "adobe", "intel", "nvidia", "amd", "mozilla", "oracle", "python", "java",
 ];
 
-fn clean_app_label(name: &str) -> String {
-    name.trim().to_string()
+/// App-data folders an installed program keeps (shown as its footprint before uninstalling).
+fn find_leftovers(name: &str, publisher: &str, location: &str) -> Vec<(String, PathBuf)> {
+    let q = LeftoverQuery {
+        app_id: String::new(),
+        name: name.to_string(),
+        publisher: publisher.to_string(),
+        install_location: String::new(),
+        force: false,
+    };
+    let _ = location;
+    let roaming = env::var("APPDATA").unwrap_or_default().to_lowercase();
+    candidate_files(&q)
+        .into_iter()
+        .filter(|i| i.kind == "folder")
+        .filter_map(|i| {
+            let p = PathBuf::from(&i.path);
+            let lower = i.path.to_lowercase();
+            let kind = if !roaming.is_empty() && lower.starts_with(&roaming) {
+                "Support"
+            } else if env::var("LOCALAPPDATA").map_or(false, |l| lower.starts_with(&l.to_lowercase())) {
+                "Caches"
+            } else {
+                return None; // Program Files etc. are the program itself, not leftovers
+            };
+            Some((kind.to_string(), p))
+        })
+        .collect()
 }
 
-fn find_leftovers(app_id: &str, name: &str, location: &str) -> Vec<(String, PathBuf)> {
-    let mut found: Vec<(String, PathBuf)> = Vec::new();
-    let mut wanted: Vec<String> = vec![clean_app_label(name)];
-    if let Some(dir_name) = Path::new(location).file_name().and_then(|s| s.to_str()) {
-        wanted.push(dir_name.to_string());
-    }
-    wanted.retain(|w| {
-        let lw = w.to_lowercase();
-        w.len() >= 3 && !GENERIC_FOLDERS.contains(&lw.as_str())
-    });
-    wanted.sort();
-    wanted.dedup();
-
-    for (var, kind) in [("LOCALAPPDATA", "Caches"), ("APPDATA", "Support")] {
-        let Ok(base) = env::var(var) else { continue };
-        let Ok(rd) = fs::read_dir(&base) else { continue };
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() || ft.is_symlink() {
-                continue;
-            }
-            let folder = entry.file_name().to_string_lossy().to_lowercase();
-            if wanted.iter().any(|w| w.to_lowercase() == folder) {
-                found.push((kind.to_string(), entry.path()));
-            }
-        }
-    }
-    let _ = app_id;
-    found
-}
-
-fn list_installed_apps_sync() -> Result<Vec<InstalledAppInfo>, String> {
+fn read_raw_apps() -> Result<Vec<RawApp>, String> {
     let script = format!(
         r#"{}
 $items = foreach ($b in $bases) {{
@@ -278,8 +293,11 @@ if (-not $items) {{ '[]' }} else {{ ConvertTo-Json -InputObject @($items) -Compr
         UNINSTALL_KEYS_PS
     );
     let json = run_powershell(&script, &[])?;
-    let raw: Vec<RawApp> =
-        serde_json::from_str(&json).map_err(|e| format!("Unexpected app list format: {}", e))?;
+    serde_json::from_str(&json).map_err(|e| format!("Unexpected app list format: {}", e))
+}
+
+fn list_installed_apps_sync() -> Result<Vec<InstalledAppInfo>, String> {
+    let raw = read_raw_apps()?;
 
     // Same program is often registered twice (32/64-bit); keep one entry.
     let mut seen: HashSet<String> = HashSet::new();
@@ -302,7 +320,7 @@ if (-not $items) {{ '[]' }} else {{ ConvertTo-Json -InputObject @($items) -Compr
             binary = dir_size(Path::new(&location)).0;
         }
 
-        let leftovers_raw = find_leftovers(&a.id, &a.name, &location);
+        let leftovers_raw = find_leftovers(&a.name, a.publisher.as_deref().unwrap_or(""), &location);
         let mut leftovers: Vec<AppLeftoverInfo> = Vec::new();
         if binary > 0 {
             leftovers.push(AppLeftoverInfo {
@@ -855,12 +873,10 @@ fn analyze_node(path: &Path, name: String, depth: usize, st: &mut AnalyzeState) 
             if ft.is_dir() {
                 if depth + 1 >= KEEP_DEPTH {
                     st.dirs += 1;
-                    let size = if Instant::now() > st.deadline {
+                    let (size, _, cut) = dir_size_until(&child_path, Some(st.deadline));
+                    if cut {
                         st.truncated = true;
-                        0
-                    } else {
-                        dir_size(&child_path).0
-                    };
+                    }
                     total += size;
                     kept.push(DiskNodeOut {
                         id: child_path.to_string_lossy().to_string(),
@@ -1211,6 +1227,36 @@ fn app_still_installed(app_id: &str) -> Result<bool, String> {
     Ok(!existing_registry_keys(&keys)?.is_empty())
 }
 
+/// Name and install folder of every other installed program.
+fn other_installed_programs(app_id: &str) -> Result<Vec<(String, String)>, String> {
+    Ok(read_raw_apps()?
+        .into_iter()
+        .filter(|a| a.id != app_id)
+        .map(|a| (a.name, a.location.unwrap_or_default().trim_matches('"').to_string()))
+        .collect())
+}
+
+/// Anything that another installed program may still be using is not pre-selected for deletion:
+/// a sibling product with the same name (32/64-bit, editions) or an overlapping install folder.
+pub fn mark_shared(items: &mut [LeftoverItem], q: &LeftoverQuery, others: &[(String, String)]) {
+    let own: Vec<String> = leftover_names(q).iter().map(|n| n.to_lowercase()).collect();
+    let sibling = others
+        .iter()
+        .any(|(n, _)| own.contains(&strip_version_tokens(n).to_lowercase()));
+    let norm = |p: &str| p.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    for it in items.iter_mut() {
+        let overlaps = it.kind != "registry"
+            && others.iter().any(|(_, loc)| {
+                let l = norm(loc);
+                let p = norm(&it.path);
+                !l.is_empty() && (p == l || l.starts_with(&format!("{}\\", p)) || p.starts_with(&format!("{}\\", l)))
+            });
+        if sibling || overlaps {
+            it.risk = "review".to_string();
+        }
+    }
+}
+
 fn find_leftovers_sync(q: LeftoverQuery) -> Result<Vec<LeftoverItem>, String> {
     if !q.force && app_still_installed(&q.app_id)? {
         return Err("This program is still installed. Finish its uninstall first.".to_string());
@@ -1229,6 +1275,12 @@ fn find_leftovers_sync(q: LeftoverQuery) -> Result<Vec<LeftoverItem>, String> {
             size_bytes: 0,
             risk: if hklm && !uninstall { "review" } else { "safe" }.to_string(),
         });
+    }
+    // If the other programs cannot be read, play safe: nothing is pre-selected.
+    let others = other_installed_programs(&q.app_id);
+    match &others {
+        Ok(o) => mark_shared(&mut items, &q, o),
+        Err(_) => items.iter_mut().for_each(|i| i.risk = "review".to_string()),
     }
     Ok(items)
 }
@@ -1296,7 +1348,8 @@ foreach ($k in ($env:BURROW_KEYS -split "`n" | Where-Object { $_ })) {
     if (-not (Test-Path -LiteralPath $k)) { $res += [pscustomobject]@{ path=$k; ok=$true; message='Already gone' }; continue }
     $native = $k -replace '^HKCU:\\','HKCU\' -replace '^HKLM:\\','HKLM\'
     $file = Join-Path $dir ("backup-$stamp-$i.reg")
-    & reg.exe export $native $file /y | Out-Null
+    & reg.exe export $native $file /y 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $file)) { throw 'Could not save a backup first, so the key was left in place' }
     Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction Stop
     $res += [pscustomobject]@{ path=$k; ok=$true; message='Removed (backup saved)' }
   } catch {
@@ -1471,6 +1524,44 @@ Mozilla Firefox (x64 en-US)   Mozilla.Firefox          130.0        131.0.2     
         assert!(keys.iter().any(|k| k == "HKLM:\\SOFTWARE\\Zoomish Inc.\\Zoomish"));
         assert!(keys.iter().any(|k| k.ends_with("\\Uninstall\\Zoomish")));
         assert!(!keys.iter().any(|k| k.to_lowercase().ends_with("\\microsoft")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_items_are_not_preselected() {
+        let q = LeftoverQuery {
+            app_id: "A".into(),
+            name: "Notepad++ (32-bit x86)".into(),
+            publisher: "Don Ho".into(),
+            install_location: String::new(),
+            force: false,
+        };
+        let mk = |path: &str, kind: &str| LeftoverItem { kind: kind.into(), path: path.into(), size_bytes: 0, risk: "safe".into() };
+
+        // sibling product with the same base name still installed
+        let mut items = vec![mk("C:\\Users\\a\\AppData\\Roaming\\Notepad++", "folder"), mk("HKCU:\\Software\\Notepad++", "registry")];
+        mark_shared(&mut items, &q, &[("Notepad++ (64-bit x64)".into(), "C:\\Program Files\\Notepad++".into())]);
+        assert!(items.iter().all(|i| i.risk == "review"));
+
+        // another program lives inside the folder we would delete
+        let mut items = vec![mk("C:\\Program Files\\Suite", "folder")];
+        mark_shared(&mut items, &q, &[("Other tool".into(), "C:\\Program Files\\Suite\\Other".into())]);
+        assert_eq!(items[0].risk, "review");
+
+        // nothing shared: stays pre-selected
+        let mut items = vec![mk("C:\\Users\\a\\AppData\\Local\\Lonely", "folder")];
+        mark_shared(&mut items, &q, &[("Unrelated".into(), "C:\\Program Files\\Unrelated".into())]);
+        assert_eq!(items[0].risk, "safe");
+    }
+
+    #[test]
+    fn analyzer_stops_at_its_deadline() {
+        let root = temp_dir("deadline");
+        for i in 0..200 {
+            fs::create_dir_all(root.join(format!("d{}", i))).unwrap();
+        }
+        let (_, _, cut) = dir_size_until(&root, Some(Instant::now() - Duration::from_secs(1)));
+        assert!(cut, "an expired deadline must stop the walk");
         let _ = fs::remove_dir_all(&root);
     }
 }

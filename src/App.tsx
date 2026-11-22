@@ -208,18 +208,18 @@ export default function App() {
   const refreshNativeApps = useCallback(async () => {
     if (!isTauriRuntime()) return;
     try {
-      const [apps, updates, startup] = await Promise.all([
+      // Show the program list straight away; the update check (winget) can be slow.
+      const [apps, startup] = await Promise.all([
         listInstalledAppsTauri(),
-        listAppUpdatesTauri().catch(() => {
-          showToast('Update checks need the Windows Package Manager, which was not found.');
-          return [];
-        }),
         listStartupItemsTauri().catch(() => []),
       ]);
-      setAppsList(appsFromNative(apps, updates));
+      setAppsList(appsFromNative(apps, []));
       setNativeStartup(startupFromNative(startup));
       setStartupStates({});
       setAppsLoaded(true);
+      listAppUpdatesTauri()
+        .then((updates) => setAppsList(appsFromNative(apps, updates)))
+        .catch(() => showToast('Update checks need the Windows Package Manager, which was not found.'));
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Could not read the installed programs.');
     }
@@ -377,6 +377,18 @@ export default function App() {
     setDrawerOpen(true);
   };
 
+  // What to search for once a program is gone (or when it has no uninstaller).
+  const leftoverQueryFor = (app: InstalledApp, force: boolean): LeftoverQuery => {
+    const binary = app.leftovers.find((l) => l.kind === 'Binary');
+    return {
+      appId: app.id,
+      name: app.name,
+      publisher: app.publisher === 'Unknown publisher' ? '' : app.publisher,
+      installLocation: binary && binary.path !== app.name ? binary.path : '',
+      force,
+    };
+  };
+
   // Show the next program's leftovers (one window at a time).
   useEffect(() => {
     if (leftoverReview || leftoverQueue.length === 0) return;
@@ -494,14 +506,7 @@ export default function App() {
                 const msg = typeof err === 'string' ? err : err instanceof Error ? err.message : 'Uninstall failed';
                 status = msg;
                 if (msg.includes('no uninstaller')) {
-                  const binary = app.leftovers.find((l) => l.kind === 'Binary');
-                  queueForReview.push({
-                    appId: app.id,
-                    name: app.name,
-                    publisher: app.publisher === 'Unknown publisher' ? '' : app.publisher,
-                    installLocation: binary && binary.path !== app.name ? binary.path : '',
-                    force: true,
-                  });
+                  queueForReview.push(leftoverQueryFor(app, true));
                   status = 'No uninstaller found: choose what to remove manually';
                 }
               }
@@ -509,14 +514,7 @@ export default function App() {
 
             // Hunt for files and registry keys left behind; the person reviews them next.
             if (ok) {
-              const binary = app.leftovers.find((l) => l.kind === 'Binary');
-              queueForReview.push({
-                appId: app.id,
-                name: app.name,
-                publisher: app.publisher === 'Unknown publisher' ? '' : app.publisher,
-                installLocation: binary && binary.path !== app.name ? binary.path : '',
-                force: false,
-              });
+              queueForReview.push(leftoverQueryFor(app, false));
             }
           }
 
@@ -1043,6 +1041,7 @@ export default function App() {
           forced={leftoverReview.query.force}
           items={leftoverReview.items}
           busy={leftoverReview.busy}
+          searching={leftoverReview.busy && leftoverReview.items.length === 0 && !leftoverReview.results}
           results={leftoverReview.results}
           onDelete={handleDeleteLeftovers}
           onClose={() => {

@@ -75,23 +75,37 @@ export function purgeFromNative(list: NativePurge[]): PurgeProject[] {
   }));
 }
 
+// Keeps digits that are part of a product name ("7-Zip", "Visual C++ 2015-2022") and
+// drops only things that look like a version number ("23.01", "14.38.33135").
 function normalizeName(name: string): string {
   return name
     .toLowerCase()
     .replace(/\([^)]*\)/g, ' ')
-    .replace(/\bv?\d+(\.\d+)*\b/g, ' ')
+    .replace(/\bv?\d+(\.\d+)+\b/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 }
 
+/** Pair each available update with the one installed program it really belongs to. */
+function matchUpdates(apps: NativeApp[], updates: NativeUpdate[]): Map<string, NativeUpdate> {
+  const matched = new Map<string, NativeUpdate>();
+  for (const u of updates) {
+    const key = normalizeName(u.name);
+    const same = apps.filter((a) => normalizeName(a.name) === key);
+    // Several installed entries share this name (editions, 32/64-bit): only trust an exact version match.
+    const pick = same.length === 1 ? same[0] : same.filter((a) => a.version === u.version)[0];
+    if (pick && !matched.has(pick.id)) matched.set(pick.id, u);
+  }
+  return matched;
+}
+
 export function appsFromNative(apps: NativeApp[], updates: NativeUpdate[]): InstalledApp[] {
-  const remaining = new Map(updates.map((u) => [u.id, u]));
-  const byName = new Map<string, NativeUpdate>();
-  for (const u of updates) byName.set(normalizeName(u.name), u);
+  const matched = matchUpdates(apps, updates);
+  const claimed = new Set([...matched.values()].map((u) => u.id));
+  const remaining = new Map(updates.filter((u) => !claimed.has(u.id)).map((u) => [u.id, u]));
 
   const out: InstalledApp[] = apps.map((a) => {
-    const upd = byName.get(normalizeName(a.name));
-    if (upd) remaining.delete(upd.id);
+    const upd = matched.get(a.id);
     return {
       id: a.id,
       name: a.name,

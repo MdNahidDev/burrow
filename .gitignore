@@ -9,3 +9,5 @@ coverage/
 
 .burrow-data/
 .aistudio/
+src-tauri/target/
+src-tauri/gen/
