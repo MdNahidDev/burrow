@@ -39,6 +39,8 @@ import {
 import {
   cleanWindowsTargetsTauri,
   deleteAppLeftoversTauri,
+  isElevatedTauri,
+  restartAsAdminTauri,
   fetchWindowsTelemetry,
   findAppLeftoversTauri,
   isTauriRuntime,
@@ -116,6 +118,7 @@ export default function App() {
   );
   const [nativeStartup, setNativeStartup] = useState<StartupItem[]>([]);
   const [appsLoaded, setAppsLoaded] = useState(false);
+  const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
 
   // Revo-style review window shown after a program has been uninstalled.
   const [leftoverQueue, setLeftoverQueue] = useState<LeftoverQuery[]>([]);
@@ -389,6 +392,18 @@ export default function App() {
     };
   };
 
+  useEffect(() => {
+    if (native) isElevatedTauri().then(setIsAdmin).catch(() => setIsAdmin(null));
+  }, [native]);
+
+  const handleRestartAsAdmin = async () => {
+    try {
+      await restartAsAdminTauri();
+    } catch (err) {
+      showToast(typeof err === 'string' ? err : 'Could not restart with administrator rights.');
+    }
+  };
+
   // Show the next program's leftovers (one window at a time).
   useEffect(() => {
     if (leftoverReview || leftoverQueue.length === 0) return;
@@ -452,7 +467,7 @@ export default function App() {
           const byId = new Map(folderTargets.map((f) => [f.id, f]));
           for (const res of nativeReports) {
             const meta = byId.get(res.id);
-            const ok = !res.status.startsWith('skipped');
+            const ok = !res.status.startsWith('skipped') && !res.status.startsWith('nothing removed');
             if (ok) succeededFolderIds.add(res.id);
             report.push({
               id: res.id,
@@ -936,6 +951,29 @@ export default function App() {
 
                   {/* Safety & Live Polling Controls */}
                   <div className="rounded-2xl glass-panel divide-y divide-[var(--border-subtle)]">
+                    {native && isAdmin !== null && (
+                      <div className="p-5 flex items-center justify-between gap-4">
+                        <div className="space-y-1">
+                          <div className="text-sm font-semibold text-[var(--text-primary)]">
+                            Administrator mode
+                          </div>
+                          <p className="text-xs text-[var(--text-secondary)]">
+                            {isAdmin
+                              ? 'On. Windows Update cache, system startup items and system tune-ups can be changed.'
+                              : 'Off. Some items (Windows Update cache, system startup items, DISM cleanup) need it.'}
+                          </p>
+                        </div>
+                        {!isAdmin && (
+                          <button
+                            onClick={handleRestartAsAdmin}
+                            className="inline-flex items-center gap-2 px-4 py-1.5 text-xs font-medium rounded-full glass-panel glass-panel-hover text-[var(--text-primary)] whitespace-nowrap"
+                          >
+                            <ShieldCheck className="w-3.5 h-3.5 text-[var(--status-safe)]" />
+                            Restart as administrator
+                          </button>
+                        )}
+                      </div>
+                    )}
                     <div className="p-5 flex items-center justify-between gap-4">
                       <div className="space-y-1">
                         <div className="text-sm font-semibold text-[var(--text-primary)]">

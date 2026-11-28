@@ -186,7 +186,8 @@ export function AnalyzerView({
   };
 
   // Hero Orb Stage matching Screenshot 4
-  if (!mapped) {
+  // In the installed app never fall back to the demo disk: map a real folder first.
+  if (!mapped || (native && !localOverrideTree)) {
     return (
       <div className="min-h-[calc(100vh-148px)] flex flex-col items-center justify-center text-center px-4">
         <div className="mb-8">

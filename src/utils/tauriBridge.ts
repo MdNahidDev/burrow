@@ -185,3 +185,6 @@ export const findAppLeftoversTauri = (query: LeftoverQuery) =>
   invokeTauri<LeftoverItem[]>('find_app_leftovers', { query });
 export const deleteAppLeftoversTauri = (query: LeftoverQuery, items: LeftoverItem[]) =>
   invokeTauri<LeftoverResult[]>('delete_app_leftovers', { query, items });
+
+export const isElevatedTauri = () => invokeTauri<boolean>('is_elevated');
+export const restartAsAdminTauri = () => invokeTauri<void>('restart_as_admin');

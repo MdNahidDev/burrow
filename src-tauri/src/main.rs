@@ -96,6 +96,60 @@ struct TelemetrySnapshot {
     network_rx_mbps: f64,
     network_tx_mbps: f64,
     processes: Vec<ProcessMetric>,
+    battery: Option<BatteryMetric>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatteryMetric {
+    percent: u8,
+    ac_online: bool,
+    charging: bool,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct SystemPowerStatus {
+    ac_line_status: u8,
+    battery_flag: u8,
+    battery_life_percent: u8,
+    system_status_flag: u8,
+    battery_life_time: u32,
+    battery_full_life_time: u32,
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+}
+
+/// Real battery state from Windows; `None` on PCs without a battery.
+#[cfg(windows)]
+fn read_battery() -> Option<BatteryMetric> {
+    let mut st = SystemPowerStatus {
+        ac_line_status: 255,
+        battery_flag: 255,
+        battery_life_percent: 255,
+        system_status_flag: 0,
+        battery_life_time: 0,
+        battery_full_life_time: 0,
+    };
+    // SAFETY: `st` is a valid, correctly laid out SYSTEM_POWER_STATUS for the call.
+    let ok = unsafe { GetSystemPowerStatus(&mut st) };
+    // battery_flag 128 = no battery, 255 = unknown; percent 255 = unknown
+    if ok == 0 || st.battery_flag & 128 != 0 || st.battery_flag == 255 || st.battery_life_percent > 100 {
+        return None;
+    }
+    Some(BatteryMetric {
+        percent: st.battery_life_percent,
+        ac_online: st.ac_line_status == 1,
+        charging: st.battery_flag & 8 != 0,
+    })
+}
+
+#[cfg(not(windows))]
+fn read_battery() -> Option<BatteryMetric> {
+    None
 }
 
 #[derive(Serialize)]
@@ -326,9 +380,12 @@ fn is_link(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn clean_directory_contents(dir: &Path) -> (usize, usize) {
+/// Deletes everything inside `dir`. Returns (entries removed, entries kept, bytes really freed).
+/// Files that are in use or need admin rights are kept and not counted as freed.
+fn clean_directory_contents(dir: &Path) -> (usize, usize, u64) {
     let mut removed = 0usize;
     let mut skipped = 0usize;
+    let mut freed = 0u64;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let child = entry.path();
@@ -336,19 +393,35 @@ fn clean_directory_contents(dir: &Path) -> (usize, usize) {
                 .file_type()
                 .map(|t| t.is_dir() && !t.is_symlink())
                 .unwrap_or(false);
+            let before = if is_real_dir {
+                native::dir_size(&child).0
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
             let res = if is_real_dir {
                 fs::remove_dir_all(&child)
             } else {
                 fs::remove_file(&child).or_else(|_| fs::remove_dir(&child))
             };
             match res {
-                Ok(_) => removed += 1,
-                Err(_) => skipped += 1,
+                Ok(_) => {
+                    removed += 1;
+                    freed = freed.saturating_add(before);
+                }
+                Err(_) => {
+                    skipped += 1;
+                    // A folder may have been partly cleaned before something was locked.
+                    let after = if is_real_dir && child.exists() { native::dir_size(&child).0 } else { before };
+                    freed = freed.saturating_add(before.saturating_sub(after));
+                }
             }
         }
     }
-    (removed, skipped)
+    (removed, skipped, freed)
 }
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -378,12 +451,91 @@ mod tests {
 
     #[test]
     fn broad_appdata_folders_are_not_cleanable() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local");
         std::env::set_var("APPDATA", "C:\\Users\\a\\AppData\\Roaming");
         assert!(!is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles")));
         assert!(!is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data")));
         assert!(is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\D3DSCache")));
         assert!(is_safe_clean_path(Path::new("C:\\Users\\a\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\Cache")));
+    }
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("burrow-e2e-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn real_clean_deletes_files_and_reports_true_size() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_root("clean");
+        let local = root.join("Local");
+        let temp = local.join("Temp");
+        fs::create_dir_all(temp.join("nested/deeper")).unwrap();
+        fs::write(temp.join("a.tmp"), vec![1u8; 4000]).unwrap();
+        fs::write(temp.join("nested/deeper/b.tmp"), vec![1u8; 6000]).unwrap();
+        env::set_var("LOCALAPPDATA", &local);
+        let target = || CleanTargetInput { id: "temp".into(), path: temp.to_string_lossy().to_string() };
+
+        // Preview must not delete anything.
+        let preview = clean_targets_blocking(vec![target()], true, None);
+        assert_eq!(preview[0].bytes, 10_000, "{}", preview[0].status);
+        assert!(temp.join("a.tmp").exists() && temp.join("nested/deeper/b.tmp").exists());
+
+        // A real run deletes the contents, keeps the folder, and reports the true amount.
+        let real = clean_targets_blocking(vec![target()], false, None);
+        assert_eq!(real[0].bytes, 10_000, "{}", real[0].status);
+        assert!(real[0].status.starts_with("cleaned"), "{}", real[0].status);
+        assert!(temp.is_dir());
+        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0, "folder should be empty");
+
+        // Running again finds nothing left.
+        let again = clean_targets_blocking(vec![target()], false, None);
+        assert_eq!(again[0].status, "already clean");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn protected_rules_and_foreign_paths_survive_a_real_clean() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = temp_root("protect");
+        let local = root.join("Local");
+        let temp = local.join("Temp");
+        let elsewhere = root.join("Documents");
+        fs::create_dir_all(&temp).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(temp.join("x.tmp"), "x").unwrap();
+        fs::write(elsewhere.join("thesis.docx"), "precious").unwrap();
+        env::set_var("LOCALAPPDATA", &local);
+
+        let guarded = clean_targets_blocking(
+            vec![CleanTargetInput { id: "t".into(), path: temp.to_string_lossy().to_string() }],
+            false,
+            Some(vec!["*\\temp*".to_string()]),
+        );
+        assert!(guarded[0].status.starts_with("skipped"), "{}", guarded[0].status);
+        assert!(temp.join("x.tmp").exists(), "protected rule must keep the file");
+
+        let foreign = clean_targets_blocking(
+            vec![CleanTargetInput { id: "d".into(), path: elsewhere.to_string_lossy().to_string() }],
+            false,
+            None,
+        );
+        assert!(foreign[0].status.starts_with("skipped"), "{}", foreign[0].status);
+        assert!(elsewhere.join("thesis.docx").exists(), "documents must never be touched");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compound_targets_split_and_expand() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::set_var("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local");
+        let parts = expand_target_paths("%LOCALAPPDATA%\\Temp + %LOCALAPPDATA%\\CrashDumps");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].to_string_lossy(), "C:\\Users\\a\\AppData\\Local\\Temp");
+        assert_eq!(parts[1].to_string_lossy(), "C:\\Users\\a\\AppData\\Local\\CrashDumps");
     }
 
     #[test]
@@ -479,6 +631,10 @@ fn get_system_telemetry(state: tauri::State<TelemetryState>) -> TelemetrySnapsho
         })
         .collect();
     drop(disks_guard);
+    // Show the drive Windows is installed on first, not whichever one the system lists first.
+    let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string()).to_lowercase();
+    let mut disks = disks;
+    disks.sort_by_key(|d| !d.mount.to_lowercase().starts_with(&system_drive));
 
     let mut net_guard = state.networks.lock().unwrap_or_else(|e| e.into_inner());
     net_guard.refresh(false);
@@ -528,6 +684,7 @@ fn get_system_telemetry(state: tauri::State<TelemetryState>) -> TelemetrySnapsho
         network_rx_mbps: (rx as f64) / (1024.0 * 1024.0) / elapsed_secs,
         network_tx_mbps: (tx as f64) / (1024.0 * 1024.0) / elapsed_secs,
         processes: top_procs,
+        battery: read_battery(),
     }
 }
 
@@ -603,6 +760,7 @@ fn clean_targets_blocking(
             };
 
             let mut total_bytes = 0u64;
+            let mut total_freed = 0u64;
             let mut total_removed = 0usize;
             let mut total_skipped = 0usize;
             let mut any_exists = false;
@@ -631,12 +789,16 @@ fn clean_targets_blocking(
 
                 if !dry_run {
                     if resolved.is_dir() {
-                        let (removed, skipped) = clean_directory_contents(&resolved);
+                        let (removed, skipped, freed) = clean_directory_contents(&resolved);
                         total_removed = total_removed.saturating_add(removed);
                         total_skipped = total_skipped.saturating_add(skipped);
+                        total_freed = total_freed.saturating_add(freed);
                     } else {
                         match fs::remove_file(&resolved) {
-                            Ok(_) => total_removed += 1,
+                            Ok(_) => {
+                                total_removed += 1;
+                                total_freed = total_freed.saturating_add(bytes);
+                            }
                             Err(_) => total_skipped += 1,
                         }
                     }
@@ -675,9 +837,13 @@ fn clean_targets_blocking(
             CleanActionReport {
                 id: target.id,
                 path: display_path,
-                bytes: total_bytes,
-                status: if total_skipped == 0 {
+                bytes: total_freed,
+                status: if total_removed == 0 && total_skipped == 0 {
+                    "already clean".to_string()
+                } else if total_skipped == 0 {
                     format!("cleaned ({} entries)", total_removed)
+                } else if total_removed == 0 {
+                    format!("nothing removed ({} in use or need administrator rights)", total_skipped)
                 } else {
                     format!("cleaned {} ({} in use)", total_removed, total_skipped)
                 },
@@ -777,6 +943,8 @@ fn main() {
             native::scan_purge_projects,
             native::analyze_path,
             native::pick_folder,
+            native::is_elevated,
+            native::restart_as_admin,
             native::find_app_leftovers,
             native::delete_app_leftovers,
         ])

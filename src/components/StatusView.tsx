@@ -1,3 +1,4 @@
+import { isTauriRuntime } from '../utils/tauriBridge';
 import {
   Activity,
   ArrowUpDown,
@@ -270,6 +271,9 @@ export function StatusView({
   const gpuLoadPct = Math.round(history.gpu[history.gpu.length - 1] ?? 4);
   const diskActivePct = Math.round(history.disk[history.disk.length - 1] ?? 3);
   const thermalTemp = Math.round(44 + telemetry.cpuOverallPct * 0.42);
+  // In the installed app, show only what Windows really reports.
+  const live = isTauriRuntime();
+  const battery = telemetry.battery ?? null;
   const coreSlice = telemetry.cores.slice(0, 4);
 
   return (
@@ -419,21 +423,21 @@ export function StatusView({
               GPU
             </span>
             <span className="px-2 py-0.5 rounded-md bg-[var(--bg-inset)] border border-[var(--glass-border)] text-[11px] text-[var(--text-secondary)] tabular-nums">
-              DirectX 12
+              {live ? 'Not measured' : 'DirectX 12'}
             </span>
           </div>
 
           <div className="flex items-baseline gap-0.5 my-1">
             <span className="text-3xl font-semibold tabular-nums text-[var(--text-primary)]">
-              {gpuLoadPct}
+              {live ? '—' : gpuLoadPct}
             </span>
-            <span className="text-sm text-[var(--text-secondary)]">%</span>
+            {!live && <span className="text-sm text-[var(--text-secondary)]">%</span>}
           </div>
 
           <div className="space-y-1.5">
-            <Sparkline values={history.gpu} color="var(--status-warn)" />
+            {!live && <Sparkline values={history.gpu} color="var(--status-warn)" />}
             <div className="text-[11px] text-[var(--text-muted)]">
-              DirectX hardware graphics
+              {live ? 'Live GPU usage is not available yet' : 'DirectX hardware graphics'}
             </div>
           </div>
         </div>
@@ -473,7 +477,7 @@ export function StatusView({
               Power
             </span>
             <span className="px-2 py-0.5 rounded-md bg-[var(--bg-inset)] border border-[var(--glass-border)] text-[11px] text-[var(--text-secondary)]">
-              100% Health
+              {battery ? (battery.charging ? 'Charging' : battery.acOnline ? 'On AC power' : 'On battery') : 'No battery'}
             </span>
           </div>
 
@@ -481,18 +485,19 @@ export function StatusView({
             <div>
               <div className="flex items-baseline gap-0.5">
                 <span className="text-3xl font-semibold tabular-nums text-[var(--text-primary)]">
-                  94
+                  {battery ? battery.percent : '—'}
                 </span>
-                <span className="text-sm text-[var(--text-secondary)]">%</span>
+                {battery && <span className="text-sm text-[var(--text-secondary)]">%</span>}
               </div>
               <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                AC plugged in
+                {battery ? (battery.acOnline ? 'AC plugged in' : 'Running on battery') : 'Plugged into mains power'}
               </div>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <RadialRing pct={94} color="var(--status-safe)" size={38} />
-              <RadialRing pct={82} color="var(--status-info)" size={38} />
-            </div>
+            {battery && (
+              <div className="flex items-center gap-2 shrink-0">
+                <RadialRing pct={battery.percent} color={battery.percent <= 20 && !battery.acOnline ? 'var(--status-danger)' : 'var(--status-safe)'} size={38} />
+              </div>
+            )}
           </div>
 
           <div className="text-[11px] text-[var(--text-muted)] tabular-nums">
@@ -575,23 +580,23 @@ export function StatusView({
               {cardEightMode === 'thermal' ? 'Thermal' : 'Disk Activity'}
             </span>
             <span className="px-2 py-0.5 rounded-md bg-[var(--bg-inset)] border border-[var(--glass-border)] text-[11px] text-[var(--text-secondary)]">
-              {cardEightMode === 'thermal' ? 'Normal' : '0 ms'}
+              {live ? 'No sensor' : cardEightMode === 'thermal' ? 'Normal' : '0 ms'}
             </span>
           </div>
 
           {cardEightMode === 'thermal' ? (
             <div className="flex items-baseline gap-2 my-1">
               <span className="text-3xl font-semibold tabular-nums text-[var(--text-primary)]">
-                {thermalTemp}°
+                {live ? '—' : `${thermalTemp}°`}
               </span>
-              <span className="text-xs font-medium text-[var(--status-safe)]">System</span>
+              {!live && <span className="text-xs font-medium text-[var(--status-safe)]">System</span>}
             </div>
           ) : (
             <div className="flex items-baseline gap-0.5 my-1">
               <span className="text-3xl font-semibold tabular-nums text-[var(--text-primary)]">
-                {diskActivePct}
+                {live ? '—' : diskActivePct}
               </span>
-              <span className="text-sm text-[var(--text-secondary)]">%</span>
+              {!live && <span className="text-sm text-[var(--text-secondary)]">%</span>}
             </div>
           )}
 

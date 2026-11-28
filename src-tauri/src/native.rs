@@ -1384,6 +1384,49 @@ pub async fn delete_app_leftovers(query: LeftoverQuery, items: Vec<LeftoverItem>
 }
 
 // ---------------------------------------------------------------------------
+// Administrator mode
+// ---------------------------------------------------------------------------
+
+/// True when Burrow is running with administrator rights.
+#[tauri::command]
+pub async fn is_elevated() -> bool {
+    tauri::async_runtime::spawn_blocking(|| {
+        run_powershell(
+            "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+            &[],
+        )
+        .map(|out| out.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Starts a second copy of Burrow with administrator rights (Windows asks for confirmation), then closes this one.
+#[tauri::command]
+pub async fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_string_lossy().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_powershell(
+            "Start-Process -FilePath $env:BURROW_EXE -Verb RunAs -ErrorAction Stop",
+            &[("BURROW_EXE", &exe_str)],
+        )
+        .map_err(|e| {
+            if e.to_lowercase().contains("cancel") {
+                "Administrator access was not granted.".to_string()
+            } else {
+                e
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    app.exit(0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1489,6 +1532,7 @@ Mozilla Firefox (x64 en-US)   Mozilla.Firefox          130.0        131.0.2     
 
     #[test]
     fn install_location_guard() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ProgramFiles", "C:\\Program Files");
         std::env::set_var("USERPROFILE", "C:\\Users\\a");
         assert!(safe_install_location(Path::new("C:\\Program Files\\Zoom")));
@@ -1501,6 +1545,7 @@ Mozilla Firefox (x64 en-US)   Mozilla.Firefox          130.0        131.0.2     
 
     #[test]
     fn leftovers_found_and_registry_candidates_built() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = temp_dir("left");
         let local = root.join("Local");
         let roaming = root.join("Roaming");
@@ -1529,6 +1574,7 @@ Mozilla Firefox (x64 en-US)   Mozilla.Firefox          130.0        131.0.2     
 
     #[test]
     fn shared_items_are_not_preselected() {
+        let _g = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let q = LeftoverQuery {
             app_id: "A".into(),
             name: "Notepad++ (32-bit x86)".into(),
@@ -1563,5 +1609,32 @@ Mozilla Firefox (x64 en-US)   Mozilla.Firefox          130.0        131.0.2     
         let (_, _, cut) = dir_size_until(&root, Some(Instant::now() - Duration::from_secs(1)));
         assert!(cut, "an expired deadline must stop the walk");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // Output captured from the real PowerShell scripts run against a fake registry.
+    const APPS_JSON: &str = r#"[{"id":"{GUID-1}","name":"7-Zip 23.01 (x64)","version":"23.01","publisher":"Igor Pavlov","location":"C:\\Program Files\\7-Zip\\","sizeKb":5600.0,"date":"20240312"},{"id":"Zoomish","name":"Zoomish","version":"","publisher":"","location":"","sizeKb":0.0,"date":""}]"#;
+    const STARTUP_JSON: &str = r#"[{"scope":"HKCU","name":"OneDrive","command":"\"C:\\Users\\a\\OneDrive\\OneDrive.exe\" /background","publisher":"","enabled":true},{"scope":"HKCU","name":"Avro Keyboard","command":"C:\\Avro\\avro.exe","publisher":"","enabled":false},{"scope":"HKCU","name":"Mole","command":"\"C:\\Mole\\mole.exe\"","publisher":"","enabled":true}]"#;
+
+    #[test]
+    fn app_list_script_output_matches_the_rust_parser() {
+        let apps: Vec<RawApp> = serde_json::from_str(APPS_JSON).unwrap();
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].name, "7-Zip 23.01 (x64)");
+        assert_eq!(apps[0].size_kb, Some(5600.0));
+        assert_eq!(apps[0].date.as_deref(), Some("20240312"));
+        assert_eq!(apps[1].id, "Zoomish");
+        assert_eq!(apps[1].version.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn startup_script_output_matches_the_rust_parser() {
+        let items: Vec<StartupEntry> = serde_json::from_str(STARTUP_JSON).unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(items[0].enabled && items[0].name == "OneDrive");
+        assert!(!items[1].enabled && items[1].name == "Avro Keyboard");
+        assert!(items[2].enabled);
+        // A single entry must still parse when PowerShell is asked for an array.
+        let one: Vec<StartupEntry> = serde_json::from_str(r#"[{"scope":"HKCU","name":"x","command":"c","publisher":"","enabled":true}]"#).unwrap();
+        assert_eq!(one.len(), 1);
     }
 }

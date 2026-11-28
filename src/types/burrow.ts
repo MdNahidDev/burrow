@@ -61,6 +61,8 @@ export interface TelemetrySnapshot {
   networkRxMbps: number;
   networkTxMbps: number;
   processes: ProcessMetric[];
+  /** Real battery state; absent or null on PCs without a battery. */
+  battery?: { percent: number; acOnline: boolean; charging: boolean } | null;
 }
 
 export interface CleanTarget {
