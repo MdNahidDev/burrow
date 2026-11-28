@@ -1,11 +1,15 @@
+import { useState } from 'react';
 import { Box, Code2, Cpu, Globe, HardDrive, Layers, Monitor, Shield, Terminal, Zap } from 'lucide-react';
 
 interface AppBadgeProps {
+  /** PNG data URL of the program's real icon; falls back to a generic badge. */
+  iconUrl?: string;
   name: string;
   size?: 'sm' | 'md';
 }
 
-export function AppBadge({ name, size = 'md' }: AppBadgeProps) {
+export function AppBadge({ name, size = 'md', iconUrl }: AppBadgeProps) {
+  const [broken, setBroken] = useState(false);
   const lower = name.toLowerCase();
   const dims = size === 'sm' ? 'w-6 h-6 rounded-md' : 'w-8 h-8 rounded-lg';
   const iconDims = size === 'sm' ? 'w-3.5 h-3.5' : 'w-4 h-4';
@@ -44,6 +48,17 @@ export function AppBadge({ name, size = 'md' }: AppBadgeProps) {
     tintVar = 'color-mix(in srgb, var(--status-info) 14%, transparent)';
     colorVar = 'var(--status-info)';
     Icon = HardDrive;
+  }
+
+  if (iconUrl && !broken) {
+    return (
+      <img
+        src={iconUrl}
+        alt=""
+        onError={() => setBroken(true)}
+        className={`${dims} shrink-0 object-contain`}
+      />
+    );
   }
 
   return (

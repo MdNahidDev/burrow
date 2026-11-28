@@ -10,6 +10,7 @@ import type {
 import type {
   CleanScanResult,
   NativeApp,
+  NativeDiscovered,
   NativeDiskNode,
   NativeDownload,
   NativePurge,
@@ -23,6 +24,29 @@ export function knownCleanTargets(): CleanTarget[] {
   return WINDOWS_CLEAN_TARGETS.filter(
     (t) => t.kind === 'cache' && t.id !== 'win-wsl-docker',
   ).map((t) => ({ ...t, sizeBytes: 0, itemCount: 0, lastModifiedDays: 0 }));
+}
+
+export function discoveredToTarget(d: NativeDiscovered): CleanTarget {
+  return {
+    id: d.id,
+    kind: 'cache',
+    category: d.category,
+    title: d.title,
+    path: d.path,
+    displayPath: d.displayPath,
+    os: 'windows',
+    sizeBytes: d.sizeBytes,
+    itemCount: d.itemCount,
+    safety: d.safety,
+    requiresAdmin: d.requiresAdmin,
+    description: d.description,
+    commandPreview: '',
+    lastModifiedDays: 0,
+    holder: d.holder ?? undefined,
+    holderProcess: d.holderProcess ?? undefined,
+    inUse: d.inUse,
+    minAgeDays: d.minAgeDays,
+  };
 }
 
 export function applyScanResults(base: CleanTarget[], results: CleanScanResult[]): CleanTarget[] {
@@ -116,6 +140,7 @@ export function appsFromNative(apps: NativeApp[], updates: NativeUpdate[]): Inst
       os: 'windows',
       binarySizeBytes: a.binarySizeBytes,
       lastUsedDays: a.installedDaysAgo,
+      iconPath: a.iconPath || undefined,
       updateSource: upd ? 'winget' : 'none',
       leftovers: a.leftovers.map(
         (l): AppLeftover => ({
@@ -164,6 +189,7 @@ export function startupFromNative(list: NativeStartup[]): StartupItem[] {
     impact: s.scope === 'HKCU' ? 'medium' : 'low',
     enabled: s.enabled,
     requiresAdmin: s.scope !== 'HKCU',
+    iconPath: s.iconPath || undefined,
   }));
 }
 

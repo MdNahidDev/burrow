@@ -79,6 +79,14 @@ export interface CleanTarget {
   description: string;
   commandPreview: string;
   lastModifiedDays: number;
+  /** Short path shown in the list when `path` holds several folders. */
+  displayPath?: string;
+  /** Program that keeps these files open (for example Chrome), and whether it is running now. */
+  holder?: string;
+  holderProcess?: string;
+  inUse?: boolean;
+  /** Files newer than this many days are left alone. */
+  minAgeDays?: number;
 }
 
 export interface AppLeftover {
@@ -102,6 +110,9 @@ export interface InstalledApp {
   updateSource: 'brew' | 'winget' | 'store' | 'none';
   updateCommand?: string;
   leftovers: AppLeftover[];
+  /** Program file the icon is read from (installed app), and the loaded picture. */
+  iconPath?: string;
+  iconUrl?: string;
 }
 
 export interface DiskNode {
@@ -139,6 +150,8 @@ export interface StartupItem {
   enabled: boolean;
   requiresAdmin: boolean;
   locked?: boolean;
+  iconPath?: string;
+  iconUrl?: string;
 }
 
 export interface OptimizeTask {

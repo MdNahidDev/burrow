@@ -32,3 +32,14 @@ rules (`*` / `?` wildcards). Always use Dry-run first.
 - **Analyzer**: maps a real folder on your PC (choose any folder with the picker).
 - **Startup**: real startup programs; turning one off/on changes the same switch Task Manager uses.
 - Some items (Windows Update cache, system startup items) need **Run as administrator**.
+
+## New in this version
+- **Clean** finds each app's caches on your PC: every Chrome, Edge and Brave profile, Firefox, Steam, Discord,
+  Slack, VS Code, Cursor, package managers and Windows temp/crash/shader caches. It shows when an app
+  (for example Chrome) is open, with a **Close it** button, keeps temp files from the last 3 days, and can
+  empty the Recycle Bin. Only folders Burrow itself discovered can be deleted.
+- **Analyze**: right-click any tile or row for *Copy path*, *Open in File Explorer*, *Move to Recycle Bin* or
+  *Delete permanently* (both ask first). Rows show their share of the folder as a bar.
+- **Duplicates**: files are compared by content (not name). Tick the copies you want to remove; one copy of
+  each file is always kept, and every file is re-checked right before it is deleted.
+- **Apps**: real program icons are shown for installed programs and startup items.

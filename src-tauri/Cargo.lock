@@ -395,8 +395,10 @@ name = "burrow"
 version = "0.1.0"
 dependencies = [
  "rfd",
+ "same-file",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo",
  "tauri",
  "tauri-build",

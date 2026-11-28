@@ -39,6 +39,10 @@ import {
 import {
   cleanWindowsTargetsTauri,
   deleteAppLeftoversTauri,
+  discoverCleanTargetsTauri,
+  emptyRecycleBinTauri,
+  getAppIconsTauri,
+  quitAppTauri,
   isElevatedTauri,
   restartAsAdminTauri,
   fetchWindowsTelemetry,
@@ -51,7 +55,6 @@ import {
   runWingetUpgradeTauri,
   scanDownloadsTauri,
   scanPurgeProjectsTauri,
-  scanWindowsTargetsTauri,
   setStartupEnabledTauri,
   uninstallAppTauri,
   type LeftoverItem,
@@ -60,9 +63,8 @@ import {
 } from './utils/tauriBridge';
 import {
   appsFromNative,
-  applyScanResults,
+  discoveredToTarget,
   downloadToTarget,
-  knownCleanTargets,
   purgeFromNative,
   startupFromNative,
 } from './utils/nativeData';
@@ -108,7 +110,7 @@ export default function App() {
   // Live working datasets that reflect GUI clean/uninstall/update actions immediately
   // In the installed app these start empty and are filled by real scans of this PC.
   const [cleanTargets, setCleanTargets] = useState<CleanTarget[]>(() =>
-    isTauriRuntime() ? knownCleanTargets() : WINDOWS_CLEAN_TARGETS,
+    isTauriRuntime() ? [] : WINDOWS_CLEAN_TARGETS,
   );
   const [purgeProjects, setPurgeProjects] = useState<PurgeProject[]>(() =>
     isTauriRuntime() ? [] : WINDOWS_PURGE_PROJECTS,
@@ -119,6 +121,7 @@ export default function App() {
   const [nativeStartup, setNativeStartup] = useState<StartupItem[]>([]);
   const [appsLoaded, setAppsLoaded] = useState(false);
   const [isAdmin, setIsAdmin] = useState<boolean | null>(null);
+  const [icons, setIcons] = useState<Record<string, string>>({});
 
   // Revo-style review window shown after a program has been uninstalled.
   const [leftoverQueue, setLeftoverQueue] = useState<LeftoverQuery[]>([]);
@@ -137,7 +140,7 @@ export default function App() {
     () =>
       new Set(
         isTauriRuntime()
-          ? ['win-user-temp', 'win-dx-shader', 'win-edge-chrome', 'win-nuget-npm']
+          ? []
           : ['win-user-temp', 'win-dx-shader', 'win-edge-chrome', 'win-nuget-npm', 'win-inst-cuda'],
       ),
   );
@@ -194,13 +197,17 @@ export default function App() {
   const refreshNativeWindowsTargets = useCallback(async () => {
     if (!isTauriRuntime()) return;
     try {
-      const base = knownCleanTargets();
-      const [results, downloads, purge] = await Promise.all([
-        scanWindowsTargetsTauri(base.map((t) => ({ id: t.id, path: t.path }))),
+      const [found, downloads, purge] = await Promise.all([
+        discoverCleanTargetsTauri(),
         scanDownloadsTauri().catch(() => []),
         scanPurgeProjectsTauri().catch(() => []),
       ]);
-      setCleanTargets([...applyScanResults(base, results), ...downloads.map(downloadToTarget)]);
+      const targets = [...found.map(discoveredToTarget), ...downloads.map(downloadToTarget)];
+      setCleanTargets(targets);
+      // Pre-select what is safe to remove right now (not admin-only, not held open by a running app).
+      setSelectedCleanIds(
+        new Set(targets.filter((t) => t.safety === 'safe' && !t.requiresAdmin && !t.inUse).map((t) => t.id)),
+      );
       setPurgeProjects(purgeFromNative(purge));
     } catch {
       showToast('Could not finish scanning this PC. Please try again.');
@@ -266,8 +273,9 @@ export default function App() {
       (native ? nativeStartup : WINDOWS_STARTUP).map((item) => ({
         ...item,
         enabled: startupStates[item.id] ?? item.enabled,
+        iconUrl: icons[item.id] || undefined,
       })),
-    [startupStates, native, nativeStartup],
+    [startupStates, native, nativeStartup, icons],
   );
 
   const activeWhitelistPatterns = useMemo(
@@ -404,6 +412,53 @@ export default function App() {
     }
   };
 
+  // Load real program icons in the background (in small batches so the list shows first).
+  useEffect(() => {
+    if (!native) return;
+    const wanted = [
+      ...appsList.map((a) => ({ id: a.id, path: a.iconPath })),
+      ...nativeStartup.map((s) => ({ id: s.id, path: s.iconPath })),
+    ].filter((x): x is { id: string; path: string } => !!x.path && !(x.id in icons));
+    if (wanted.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < wanted.length && !cancelled; i += 40) {
+        try {
+          const got = await getAppIconsTauri(wanted.slice(i, i + 40));
+          if (cancelled) return;
+          setIcons((prev) => {
+            const next = { ...prev };
+            for (const w of wanted.slice(i, i + 40)) {
+              next[w.id] = got[w.id] ? `data:image/png;base64,${got[w.id]}` : '';
+            }
+            return next;
+          });
+        } catch {
+          return;
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [native, appsList, nativeStartup]);
+
+  const appsWithIcons = useMemo(
+    () => appsList.map((a) => (icons[a.id] ? { ...a, iconUrl: icons[a.id] } : a)),
+    [appsList, icons],
+  );
+
+  const handleQuitApp = async (processName: string) => {
+    try {
+      await quitAppTauri(processName);
+      showToast('Closed. Scanning again…');
+    } catch (err) {
+      showToast(typeof err === 'string' ? err : 'Could not close the program.');
+    }
+    await refreshNativeWindowsTargets();
+  };
+
   // Show the next program's leftovers (one window at a time).
   useEffect(() => {
     if (leftoverReview || leftoverQueue.length === 0) return;
@@ -448,19 +503,44 @@ export default function App() {
 
       // 1. Temp, caches, installers, and build clutter folders
       const folderTargets = [
-        ...stagedCleanTargets.map((t) => ({ id: t.id, title: t.title, path: t.path, bytes: t.sizeBytes })),
+        ...stagedCleanTargets.map((t) => ({
+          id: t.id,
+          title: t.title,
+          path: t.path,
+          bytes: t.sizeBytes,
+          minAgeDays: t.minAgeDays ?? 0,
+        })),
         ...stagedPurgeProjects.map((p) => ({
           id: p.id,
           title: `${p.projectName} (${p.artifactType})`,
           path: p.path,
           bytes: p.sizeBytes,
+          minAgeDays: 0,
         })),
       ];
 
       if (folderTargets.length > 0) {
         if (tauriAttached) {
+          // The Recycle Bin is emptied through Windows itself, not by deleting files.
+          const bin = folderTargets.find((f) => f.id === 'recycle-bin');
+          if (bin) {
+            let ok = true;
+            let status = asDryRun ? 'Ready to empty' : 'Emptied';
+            if (!asDryRun) {
+              try {
+                await emptyRecycleBinTauri();
+                succeededFolderIds.add(bin.id);
+              } catch (err) {
+                ok = false;
+                status = typeof err === 'string' ? err : 'Could not empty the Recycle Bin';
+              }
+            }
+            report.push({ id: bin.id, label: bin.title, detail: 'Recycle Bin', bytes: bin.bytes, status, ok });
+          }
           const nativeReports = await cleanWindowsTargetsTauri(
-            folderTargets.map((f) => ({ id: f.id, path: f.path })),
+            folderTargets
+              .filter((f) => f.id !== 'recycle-bin')
+              .map((f) => ({ id: f.id, path: f.path, minAgeDays: f.minAgeDays })),
             asDryRun,
             activeWhitelistPatterns,
           );
@@ -788,13 +868,14 @@ export default function App() {
             onAddWhitelist={(pattern, reason) => handleAddWhitelist(pattern, reason, WINDOWS_OS)}
             onOpenDryRun={openActionRunner}
             onRescan={native ? refreshNativeWindowsTargets : undefined}
+            onQuitApp={native ? handleQuitApp : undefined}
           />
         )}
 
         {activeTab === 'apps' && (
           <AppsView
             os={WINDOWS_OS}
-            apps={appsList}
+            apps={appsWithIcons}
             startupItems={startupItems}
             selectedUninstallIds={selectedUninstallIds}
             selectedUpgradeIds={selectedUpgradeIds}

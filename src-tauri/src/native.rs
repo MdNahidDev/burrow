@@ -77,7 +77,7 @@ pub fn run_powershell(script: &str, envs: &[(&str, &str)]) -> Result<String, Str
 }
 
 /// Run `f` over `items` on a small thread pool, keeping the input order.
-fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
     let workers = 8.min(items.len().max(1));
@@ -206,6 +206,7 @@ pub struct InstalledAppInfo {
     pub install_location: String,
     pub binary_size_bytes: u64,
     pub installed_days_ago: i64,
+    pub icon_path: String,
     pub leftovers: Vec<AppLeftoverInfo>,
 }
 
@@ -225,6 +226,8 @@ struct RawApp {
     size_kb: Option<f64>,
     #[serde(default)]
     date: Option<String>,
+    #[serde(default)]
+    icon: Option<String>,
 }
 
 const UNINSTALL_KEYS_PS: &str = r#"
@@ -285,6 +288,7 @@ $items = foreach ($b in $bases) {{
         location = [string]$_.InstallLocation
         sizeKb = [double]($_.EstimatedSize)
         date = [string]$_.InstallDate
+        icon = [string]$_.DisplayIcon
       }}
     }}
 }}
@@ -346,6 +350,10 @@ fn list_installed_apps_sync() -> Result<Vec<InstalledAppInfo>, String> {
             });
         }
 
+        let icon_path = crate::files::pick_icon_path(a.icon.as_deref().unwrap_or(""), &location, &a.name)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         InstalledAppInfo {
             id: a.id.clone(),
             name: a.name.trim().to_string(),
@@ -354,6 +362,7 @@ fn list_installed_apps_sync() -> Result<Vec<InstalledAppInfo>, String> {
             install_location: location,
             binary_size_bytes: binary,
             installed_days_ago: install_age_days(a.date.as_deref().unwrap_or("")),
+            icon_path,
             leftovers,
         }
     });
@@ -519,6 +528,8 @@ pub struct StartupEntry {
     #[serde(default)]
     pub publisher: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub icon_path: String,
 }
 
 #[tauri::command]
@@ -552,8 +563,14 @@ foreach ($d in $defs) {
 if (-not $items) { '[]' } else { ConvertTo-Json -InputObject @($items) -Compress }
 "#;
         let json = run_powershell(script, &[])?;
-        serde_json::from_str::<Vec<StartupEntry>>(&json)
-            .map_err(|e| format!("Unexpected startup list format: {}", e))
+        let mut items = serde_json::from_str::<Vec<StartupEntry>>(&json)
+            .map_err(|e| format!("Unexpected startup list format: {}", e))?;
+        for it in items.iter_mut() {
+            it.icon_path = crate::files::exe_from_command(&it.command)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+        }
+        Ok(items)
     })
     .await
     .map_err(|e| e.to_string())?

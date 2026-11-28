@@ -30,6 +30,8 @@ interface DeepCleanViewProps {
   scanned: boolean;
   onSetScanned: (scanned: boolean) => void;
   onRescan?: () => Promise<void>;
+  /** Politely close a running program (for example Chrome) so its cache can be cleaned. */
+  onQuitApp?: (processName: string) => void;
   onAddWhitelist: (pattern: string, reason: string) => void;
   onOpenDryRun: () => void;
 }
@@ -50,6 +52,7 @@ export function DeepCleanView({
   scanned,
   onSetScanned,
   onRescan,
+  onQuitApp,
   onAddWhitelist,
   onOpenDryRun,
 }: DeepCleanViewProps) {
@@ -392,6 +395,24 @@ export function DeepCleanView({
                           Protected
                         </span>
                       )}
+                      {item.inUse && (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--status-warn)]">
+                          <Lock className="w-3 h-3" />
+                          {item.holder ?? 'A program'} is open, some files stay
+                          {onQuitApp && item.holderProcess && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onQuitApp(item.holderProcess as string);
+                              }}
+                              className="underline underline-offset-2 hover:text-[var(--text-primary)]"
+                            >
+                              Close it
+                            </button>
+                          )}
+                        </span>
+                      )}
                     </div>
 
                     <p className="text-xs text-[var(--text-secondary)]">
@@ -399,7 +420,7 @@ export function DeepCleanView({
                     </p>
 
                     <div className="flex flex-wrap items-center gap-x-3 text-xs text-[var(--text-muted)] tabular-nums">
-                      <span className="font-mono truncate max-w-full">{item.path}</span>
+                      <span className="font-mono truncate max-w-full">{item.displayPath ?? item.path}</span>
                       <span>{formatNumber(item.itemCount)} items</span>
                       <span>Updated {formatRelativeDays(item.lastModifiedDays)}</span>
                     </div>
@@ -411,7 +432,7 @@ export function DeepCleanView({
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          onAddWhitelist(item.path, `Protected from ${item.title}`);
+                          item.path.split(' + ').forEach((p) => onAddWhitelist(p, `Protected from ${item.title}`));
                         }}
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-xs text-[var(--text-secondary)] hover:text-[var(--status-info)] rounded-full border border-[var(--glass-border)] transition-colors whitespace-nowrap"
                       >

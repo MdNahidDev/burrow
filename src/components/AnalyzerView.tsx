@@ -1,10 +1,18 @@
-import { ChevronRight, Copy, FolderOpen, FolderTree, RefreshCw, RotateCcw } from 'lucide-react';
+import { ChevronRight, Copy, FolderOpen, FolderTree, Loader2, RefreshCw, RotateCcw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { DiskNode, OsTarget } from '../types/burrow';
 import { formatBytes, formatRelativeDays } from '../utils/format';
 import { scanLocalDirectoryPicker } from '../utils/localFolderScanner';
 import { diskNodeFromNative } from '../utils/nativeData';
-import { analyzePathTauri, pickFolderTauri } from '../utils/tauriBridge';
+import {
+  analyzePathTauri,
+  pickFolderTauri,
+  revealInExplorerTauri,
+  trashPathsTauri,
+} from '../utils/tauriBridge';
+import { removeNodesById } from '../utils/treeEdit';
+import { DuplicatesPanel } from './DuplicatesPanel';
+import { NodeContextMenu, type NodeMenuAction } from './NodeContextMenu';
 import { computeSquarifiedTreemap } from '../utils/treemap';
 import { PlanetOrb } from './PlanetOrb';
 
@@ -55,6 +63,9 @@ export function AnalyzerView({
   const [scanningLocal, setScanningLocal] = useState(false);
   const [pathStack, setPathStack] = useState<string[]>([]);
   const [hoveredNode, setHoveredNode] = useState<{ node: DiskNode; pct: number } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; node: DiskNode } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{ node: DiskNode; permanent: boolean } | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [boxSize, setBoxSize] = useState({ width: 880, height: 380 });
@@ -135,6 +146,60 @@ export function AnalyzerView({
       }))
       .sort((a, b) => b.wastedBytes - a.wastedBytes);
   }, [allFiles]);
+
+  const openMenu = (e: React.MouseEvent, node: DiskNode) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenu({ x: e.clientX, y: e.clientY, node });
+  };
+
+  const handleMenuAction = async (action: NodeMenuAction) => {
+    const node = menu?.node;
+    setMenu(null);
+    if (!node) return;
+    if (action === 'copy') {
+      try {
+        await navigator.clipboard.writeText(node.path);
+        onNotify('Path copied.');
+      } catch {
+        onNotify('Could not copy the path.');
+      }
+    } else if (action === 'reveal') {
+      if (!native) {
+        onNotify('Opening File Explorer works in the installed app.');
+        return;
+      }
+      revealInExplorerTauri(node.path).catch((err) =>
+        onNotify(typeof err === 'string' ? err : 'Could not open File Explorer.'),
+      );
+    } else {
+      setPendingDelete({ node, permanent: action === 'delete' });
+    }
+  };
+
+  const performDelete = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      const [res] = await trashPathsTauri([pendingDelete.node.path], pendingDelete.permanent);
+      if (res?.ok) {
+        const gone = pendingDelete.node;
+        setLocalOverrideTree((t) => (t ? removeNodesById(t, new Set([gone.id])) : t));
+        onNotify(
+          pendingDelete.permanent
+            ? `Deleted "${gone.name}" (${formatBytes(gone.sizeBytes)}).`
+            : `Moved "${gone.name}" (${formatBytes(gone.sizeBytes)}) to the Recycle Bin.`,
+        );
+      } else {
+        onNotify(res?.message ?? 'Could not remove that item.');
+      }
+    } catch (err) {
+      onNotify(typeof err === 'string' ? err : 'Could not remove that item.');
+    } finally {
+      setDeleting(false);
+      setPendingDelete(null);
+    }
+  };
 
   // Map a real folder on this PC with the native engine ('' = your user folder).
   const runNativeScan = async (choose: boolean) => {
@@ -260,7 +325,7 @@ export function AnalyzerView({
                   : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
               }`}
             >
-              Duplicates ({duplicateGroups.length})
+              {native ? 'Duplicates' : `Duplicates (${duplicateGroups.length})`}
             </button>
           </div>
 
@@ -362,6 +427,7 @@ export function AnalyzerView({
                           setPathStack([...pathStack, rect.node.id]);
                         }
                       }}
+                      onContextMenu={(e) => openMenu(e, rect.node)}
                       onMouseEnter={() => setHoveredNode({ node: rect.node, pct: rect.pct })}
                       onMouseLeave={() => setHoveredNode(null)}
                       className={canDrill ? 'cursor-pointer' : 'cursor-default'}
@@ -421,11 +487,20 @@ export function AnalyzerView({
                 <div
                   key={child.id}
                   onClick={() => canDrill && setPathStack([...pathStack, child.id])}
-                  className={`px-5 py-2.5 flex items-center justify-between gap-4 text-xs ${
+                  onContextMenu={(e) => openMenu(e, child)}
+                  className={`relative px-5 py-2.5 flex items-center justify-between gap-4 text-xs ${
                     canDrill ? 'cursor-pointer hover:bg-[var(--bg-surface-hover)]' : ''
                   }`}
                 >
-                  <div className="min-w-0 flex items-center gap-3">
+                  <div
+                    aria-hidden="true"
+                    className="absolute inset-y-0 left-0 opacity-[0.12] pointer-events-none"
+                    style={{
+                      width: `${Math.min(100, pct)}%`,
+                      backgroundColor: CATEGORY_FILL_VAR[child.category ?? 'other'] ?? 'var(--cat-other)',
+                    }}
+                  />
+                  <div className="relative min-w-0 flex items-center gap-3">
                     <span
                       className="w-2.5 h-2.5 rounded-xs shrink-0"
                       style={{ backgroundColor: CATEGORY_FILL_VAR[child.category ?? 'other'] ?? 'var(--cat-other)' }}
@@ -437,7 +512,7 @@ export function AnalyzerView({
                       {child.path}
                     </span>
                   </div>
-                  <div className="flex items-center gap-4 shrink-0 tabular-nums">
+                  <div className="relative flex items-center gap-4 shrink-0 tabular-nums">
                     <span className="text-[var(--text-muted)] w-14 text-right">
                       {pct.toFixed(1)}%
                     </span>
@@ -456,7 +531,11 @@ export function AnalyzerView({
         <div className="rounded-2xl glass-panel overflow-hidden">
           <div className="divide-y divide-[var(--border-subtle)]">
             {largeFiles.map((file) => (
-              <div key={file.id} className="px-5 py-3 flex items-center justify-between gap-4 text-xs">
+              <div
+                key={file.id}
+                onContextMenu={(e) => openMenu(e, file)}
+                className="px-5 py-3 flex items-center justify-between gap-4 text-xs hover:bg-[var(--bg-surface-hover)]"
+              >
                 <div className="min-w-0 space-y-0.5">
                   <div className="font-medium text-[var(--text-primary)] truncate">
                     {file.name}
@@ -480,7 +559,18 @@ export function AnalyzerView({
         </div>
       )}
 
-      {tab === 'duplicates' && (
+      {tab === 'duplicates' && native && (
+        <DuplicatesPanel
+          rootPath={currentNode.path}
+          rootName={currentNode.name}
+          onNotify={onNotify}
+          onDeleted={(paths) =>
+            setLocalOverrideTree((t) => (t ? removeNodesById(t, new Set(paths)) : t))
+          }
+        />
+      )}
+
+      {tab === 'duplicates' && !native && (
         <div className="rounded-2xl glass-panel overflow-hidden">
           <div className="divide-y divide-[var(--border-subtle)]">
             {duplicateGroups.map((group) => (
@@ -512,6 +602,52 @@ export function AnalyzerView({
                 No duplicate large files detected in this folder.
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {menu && (
+        <NodeContextMenu
+          x={menu.x}
+          y={menu.y}
+          canDelete={native}
+          onAction={handleMenuAction}
+          onClose={() => setMenu(null)}
+        />
+      )}
+
+      {pendingDelete && (
+        <div className="fixed inset-0 z-[75] flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-md rounded-2xl glass-panel border border-[var(--border-subtle)] p-6 space-y-4">
+            <h3 className="text-base font-semibold text-[var(--text-primary)] break-words">
+              {pendingDelete.permanent ? 'Permanently delete' : 'Move to Recycle Bin'} “{pendingDelete.node.name}”?
+            </h3>
+            <p className="text-xs text-[var(--text-secondary)] break-all">
+              {pendingDelete.node.path} · {formatBytes(pendingDelete.node.sizeBytes)}
+              {pendingDelete.node.kind === 'directory' ? ' · everything inside it' : ''}
+            </p>
+            <p className="text-xs text-[var(--text-secondary)]">
+              {pendingDelete.permanent
+                ? 'This cannot be undone.'
+                : 'You can restore it from the Recycle Bin.'}
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setPendingDelete(null)}
+                disabled={deleting}
+                className="px-4 py-2 text-xs font-medium rounded-full glass-panel glass-panel-hover text-[var(--text-primary)]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={performDelete}
+                disabled={deleting}
+                className="inline-flex items-center gap-2 px-5 py-2 text-xs font-semibold rounded-full bg-[var(--pill-active-bg)] text-[var(--pill-active-text)] disabled:opacity-60"
+              >
+                {deleting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                {deleting ? 'Removing…' : pendingDelete.permanent ? 'Delete' : 'Move to Recycle Bin'}
+              </button>
+            </div>
           </div>
         </div>
       )}

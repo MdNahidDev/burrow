@@ -6,6 +6,7 @@ type TauriInvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise
 export interface CleanTargetInput {
   id: string;
   path: string;
+  minAgeDays?: number;
 }
 
 export interface CleanScanResult {
@@ -93,6 +94,7 @@ export interface NativeApp {
   installLocation: string;
   binarySizeBytes: number;
   installedDaysAgo: number;
+  iconPath?: string;
   leftovers: NativeLeftover[];
 }
 
@@ -109,6 +111,7 @@ export interface NativeStartup {
   command: string;
   publisher: string;
   enabled: boolean;
+  iconPath?: string;
 }
 
 export interface NativeDownload {
@@ -188,3 +191,59 @@ export const deleteAppLeftoversTauri = (query: LeftoverQuery, items: LeftoverIte
 
 export const isElevatedTauri = () => invokeTauri<boolean>('is_elevated');
 export const restartAsAdminTauri = () => invokeTauri<void>('restart_as_admin');
+
+// ---- Smarter cleaning, file actions, duplicates and icons ----
+
+export interface NativeDiscovered {
+  id: string;
+  title: string;
+  description: string;
+  category: string;
+  path: string;
+  displayPath: string;
+  sizeBytes: number;
+  itemCount: number;
+  safety: 'safe' | 'moderate' | 'caution';
+  requiresAdmin: boolean;
+  holder: string | null;
+  holderProcess: string | null;
+  inUse: boolean;
+  minAgeDays: number;
+}
+
+export interface TrashResult {
+  path: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface DupFile {
+  path: string;
+  name: string;
+  modifiedDaysAgo: number;
+}
+
+export interface DupGroup {
+  hash: string;
+  sizeBytes: number;
+  wastedBytes: number;
+  files: DupFile[];
+}
+
+export interface DupResult {
+  groups: DupGroup[];
+  scannedFiles: number;
+  truncated: boolean;
+}
+
+export const discoverCleanTargetsTauri = () => invokeTauri<NativeDiscovered[]>('discover_clean_targets');
+export const quitAppTauri = (process: string) => invokeTauri<string>('quit_app', { process });
+export const emptyRecycleBinTauri = () => invokeTauri<string>('empty_recycle_bin');
+export const trashPathsTauri = (paths: string[], permanent: boolean) =>
+  invokeTauri<TrashResult[]>('trash_paths', { paths, permanent });
+export const revealInExplorerTauri = (path: string) => invokeTauri<void>('reveal_in_explorer', { path });
+export const findDuplicatesTauri = (path: string) => invokeTauri<DupResult>('find_duplicates', { path });
+export const deleteDuplicatesTauri = (items: { keep: string; delete: string[] }[], permanent: boolean) =>
+  invokeTauri<TrashResult[]>('delete_duplicates', { items, permanent });
+export const getAppIconsTauri = (items: { id: string; path: string }[]) =>
+  invokeTauri<Record<string, string>>('get_app_icons', { items });

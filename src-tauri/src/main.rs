@@ -9,6 +9,8 @@ use sysinfo::{
     CpuRefreshKind, Disks, MemoryRefreshKind, Networks, ProcessRefreshKind, ProcessesToUpdate,
     RefreshKind, System,
 };
+mod cleaner;
+mod files;
 mod native;
 
 struct TelemetryState {
@@ -166,6 +168,8 @@ struct CleanScanResult {
 struct CleanTargetInput {
     id: String,
     path: String,
+    #[serde(default)]
+    min_age_days: u64,
 }
 
 #[derive(Serialize)]
@@ -306,6 +310,10 @@ fn is_safe_clean_path(path: &Path) -> bool {
     if is_safe_purge_path(path, &normalized) {
         return true;
     }
+    // Per-app cache folders found by the cleaner (every browser profile, Steam, VS Code, ...).
+    if cleaner::is_candidate_path(&normalized) {
+        return true;
+    }
 
     // Never touch virtual disks, key stores or personal document folders.
     const DENY_EXT: [&str; 6] = [".vhdx", ".vhd", ".vmdk", ".vdi", ".avhdx", ".iso"];
@@ -382,13 +390,23 @@ fn is_link(path: &Path) -> bool {
 
 /// Deletes everything inside `dir`. Returns (entries removed, entries kept, bytes really freed).
 /// Files that are in use or need admin rights are kept and not counted as freed.
-fn clean_directory_contents(dir: &Path) -> (usize, usize, u64) {
+fn clean_directory_contents(dir: &Path, min_age_secs: u64) -> (usize, usize, u64) {
+    let cutoff = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(min_age_secs));
     let mut removed = 0usize;
     let mut skipped = 0usize;
     let mut freed = 0u64;
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let child = entry.path();
+            if min_age_secs > 0 {
+                let recent = match (entry.metadata().and_then(|m| m.modified()).ok(), cutoff) {
+                    (Some(m), Some(c)) => m > c,
+                    _ => false,
+                };
+                if recent {
+                    continue; // recently used files are left alone
+                }
+            }
             let is_real_dir = entry
                 .file_type()
                 .map(|t| t.is_dir() && !t.is_symlink())
@@ -443,6 +461,7 @@ mod tests {
         let target = CleanTargetInput {
             id: "t".into(),
             path: project.join("node_modules").to_string_lossy().to_string(),
+            min_age_days: 0,
         };
         let reports = clean_targets_blocking(vec![target], false, None);
         assert!(elsewhere.join("keep.txt").exists(), "link target was emptied: {:?}", reports.iter().map(|r| &r.status).collect::<Vec<_>>());
@@ -477,7 +496,7 @@ mod tests {
         fs::write(temp.join("a.tmp"), vec![1u8; 4000]).unwrap();
         fs::write(temp.join("nested/deeper/b.tmp"), vec![1u8; 6000]).unwrap();
         env::set_var("LOCALAPPDATA", &local);
-        let target = || CleanTargetInput { id: "temp".into(), path: temp.to_string_lossy().to_string() };
+        let target = || CleanTargetInput { id: "temp".into(), path: temp.to_string_lossy().to_string(), min_age_days: 0 };
 
         // Preview must not delete anything.
         let preview = clean_targets_blocking(vec![target()], true, None);
@@ -511,7 +530,7 @@ mod tests {
         env::set_var("LOCALAPPDATA", &local);
 
         let guarded = clean_targets_blocking(
-            vec![CleanTargetInput { id: "t".into(), path: temp.to_string_lossy().to_string() }],
+            vec![CleanTargetInput { id: "t".into(), path: temp.to_string_lossy().to_string(), min_age_days: 0 }],
             false,
             Some(vec!["*\\temp*".to_string()]),
         );
@@ -519,7 +538,7 @@ mod tests {
         assert!(temp.join("x.tmp").exists(), "protected rule must keep the file");
 
         let foreign = clean_targets_blocking(
-            vec![CleanTargetInput { id: "d".into(), path: elsewhere.to_string_lossy().to_string() }],
+            vec![CleanTargetInput { id: "d".into(), path: elsewhere.to_string_lossy().to_string(), min_age_days: 0 }],
             false,
             None,
         );
@@ -784,12 +803,17 @@ fn clean_targets_blocking(
                     continue;
                 }
                 any_exists = true;
-                let (bytes, _) = measure_folder_fast(&resolved);
+                let age_secs = target.min_age_days.saturating_mul(86_400);
+                let (bytes, _) = if age_secs > 0 && resolved.is_dir() {
+                    cleaner::eligible_size(&resolved, age_secs)
+                } else {
+                    measure_folder_fast(&resolved)
+                };
                 total_bytes = total_bytes.saturating_add(bytes);
 
                 if !dry_run {
                     if resolved.is_dir() {
-                        let (removed, skipped, freed) = clean_directory_contents(&resolved);
+                        let (removed, skipped, freed) = clean_directory_contents(&resolved, age_secs);
                         total_removed = total_removed.saturating_add(removed);
                         total_skipped = total_skipped.saturating_add(skipped);
                         total_freed = total_freed.saturating_add(freed);
@@ -944,6 +968,14 @@ fn main() {
             native::analyze_path,
             native::pick_folder,
             native::is_elevated,
+            files::trash_paths,
+            files::reveal_in_explorer,
+            files::find_duplicates,
+            files::delete_duplicates,
+            files::get_app_icons,
+            files::empty_recycle_bin,
+            cleaner::discover_clean_targets,
+            cleaner::quit_app,
             native::restart_as_admin,
             native::find_app_leftovers,
             native::delete_app_leftovers,

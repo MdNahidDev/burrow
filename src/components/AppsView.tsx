@@ -253,7 +253,7 @@ export function AppsView({
                   }`}
                 >
                   <div className="flex items-center gap-3.5 min-w-0">
-                    <AppBadge name={app.name} />
+                    <AppBadge name={app.name} iconUrl={app.iconUrl} />
                     <div className="min-w-0">
                       <div className="text-sm font-medium text-[var(--text-primary)] truncate">
                         {app.name}
@@ -306,7 +306,7 @@ export function AppsView({
                 className="px-4 py-3 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-[var(--bg-surface-hover)] transition-colors"
               >
                 <div className="flex items-center gap-3.5 min-w-0">
-                  <AppBadge name={item.name} />
+                  <AppBadge name={item.name} iconUrl={item.iconUrl} />
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium text-[var(--text-primary)]">
